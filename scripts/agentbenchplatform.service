@@ -1,0 +1,13 @@
+[Unit]
+Description=AgentBenchPlatform Server
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=%h/Dev/AgentBenchPlatform/.venv/bin/agentbenchplatform server start --foreground
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-%h/.config/agentbenchplatform/env
+
+[Install]
+WantedBy=default.target

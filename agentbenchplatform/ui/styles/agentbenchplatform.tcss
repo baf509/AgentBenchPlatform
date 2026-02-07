@@ -1,0 +1,132 @@
+/* agentbench TUI styles */
+
+Screen {
+    background: $surface;
+}
+
+#header-bar {
+    dock: top;
+    height: 1;
+    background: $accent;
+    color: $text;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#footer-bar {
+    dock: bottom;
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+#main-container {
+    layout: grid;
+    grid-size: 2 2;
+    grid-columns: 1fr 2fr;
+    grid-rows: 2fr 1fr;
+}
+
+#task-tree-panel {
+    row-span: 1;
+    border: solid $primary;
+    padding: 0 1;
+}
+
+#detail-panel {
+    row-span: 1;
+    border: solid $primary;
+    padding: 0 1;
+}
+
+#tools-panel {
+    border: solid $secondary;
+    padding: 0 1;
+}
+
+#coordinator-panel {
+    border: solid $secondary;
+    padding: 0 1;
+}
+
+.panel-title {
+    text-style: bold;
+    color: $accent;
+    padding: 0 0 1 0;
+}
+
+#task-tree {
+    height: 100%;
+}
+
+#log-viewer {
+    height: 100%;
+    overflow-y: auto;
+}
+
+#tools-menu {
+    height: 1fr;
+}
+
+#vitals-text {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#coordinator-log {
+    height: auto;
+    max-height: 100%;
+    overflow-y: auto;
+}
+
+#coordinator-input {
+    dock: bottom;
+    height: 3;
+}
+
+.session-running {
+    color: $success;
+}
+
+.session-paused {
+    color: $warning;
+}
+
+.session-failed {
+    color: $error;
+}
+
+.session-completed {
+    color: $text-muted;
+}
+
+RichLog {
+    scrollbar-size: 1 1;
+}
+
+Tree {
+    scrollbar-size: 1 1;
+}
+
+#db-container {
+    height: 1fr;
+}
+
+#db-tree {
+    width: 1fr;
+    border: solid $primary;
+    padding: 0 1;
+}
+
+#db-detail {
+    width: 1fr;
+    border: solid $secondary;
+    padding: 0 1;
+}
+
+#db-title {
+    text-style: bold;
+    color: $accent;
+    padding: 0 0 1 0;
+}

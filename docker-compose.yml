@@ -1,0 +1,22 @@
+services:
+  # MongoDB with Atlas Search + Vector Search (mongot built in)
+  mongodb:
+    image: mongodb/mongodb-atlas-local:latest
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - mongodb_mongot:/data/mongot
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  mongodb_data:
+  mongodb_config:
+  mongodb_mongot:
