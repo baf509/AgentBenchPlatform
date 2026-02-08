@@ -61,13 +61,14 @@ def server_start(foreground: bool):
 
             # Wait for shutdown signal
             stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
 
-            def _handle_signal(signum, frame):
-                click.echo(f"\nReceived signal {signum}, shutting down...")
+            def _handle_signal():
+                click.echo("\nReceived shutdown signal...")
                 stop_event.set()
 
-            signal.signal(signal.SIGTERM, _handle_signal)
-            signal.signal(signal.SIGINT, _handle_signal)
+            loop.add_signal_handler(signal.SIGTERM, _handle_signal)
+            loop.add_signal_handler(signal.SIGINT, _handle_signal)
 
             await stop_event.wait()
 

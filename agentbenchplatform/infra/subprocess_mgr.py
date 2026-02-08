@@ -135,6 +135,15 @@ class SubprocessManager:
             stderr=asyncio.subprocess.DEVNULL,
         )
 
+        # Use Ctrl-] as prefix so TUI apps (opencode, etc.) that
+        # capture Ctrl-b don't block tmux detach
+        await asyncio.create_subprocess_exec(
+            "tmux", "set-option", "-t", full_session,
+            "prefix", "C-]",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
         # Get pane ID and PID
         pane_id = await self._get_pane_id(full_session, window_name)
         pid = await self._get_pane_pid(full_session, window_name)

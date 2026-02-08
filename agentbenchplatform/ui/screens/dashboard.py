@@ -114,7 +114,8 @@ class DashboardScreen(BaseScreen):
 
         try:
             output = await self.ctx.session_service.get_session_output(
-                self._selected_session_id, lines=50,
+                self._selected_session_id,
+                lines=50,
             )
             viewer = self.query_one(LogViewer)
             viewer.update_output(output)
@@ -133,12 +134,19 @@ class DashboardScreen(BaseScreen):
             last_coordinator_dt = None
             convos = await app.ctx.coordinator_history_repo.list_conversations()
             if convos:
-                last_coordinator_dt = convos[0].get("updated_at")
+                updated_at = convos[0].get("updated_at")
+                if isinstance(updated_at, str):
+                    from datetime import datetime
+
+                    try:
+                        last_coordinator_dt = datetime.fromisoformat(updated_at)
+                    except ValueError:
+                        last_coordinator_dt = None
+                else:
+                    last_coordinator_dt = updated_at
 
             vitals = self.query_one("#vitals-text", VitalsPanel)
-            vitals.update_vitals(
-                self._last_snapshot, usage_totals, last_coordinator_dt
-            )
+            vitals.update_vitals(self._last_snapshot, usage_totals, last_coordinator_dt)
         except Exception:
             logger.debug("Error refreshing vitals", exc_info=True)
 
@@ -155,9 +163,7 @@ class DashboardScreen(BaseScreen):
             self._selected_task_id = data.get("id", "")
             self._selected_session_id = ""
             self._selected_tmux_target = ""
-            self.run_worker(
-                self._show_task_detail(data.get("slug", ""), data.get("id", ""))
-            )
+            self.run_worker(self._show_task_detail(data.get("slug", ""), data.get("id", "")))
 
         elif data.get("type") == "session":
             self._selected_session_id = data.get("id", "")
@@ -229,13 +235,11 @@ class DashboardScreen(BaseScreen):
             f"  Kind: {session.kind.value}",
             f"  Lifecycle: {session.lifecycle.value}",
             f"  Agent: {session.agent_backend}",
-            f"  PID: {session.attachment.pid or 'N/A'} "
-            f"({'alive' if alive else 'dead'})",
+            f"  PID: {session.attachment.pid or 'N/A'} ({'alive' if alive else 'dead'})",
         ]
         if session.attachment.tmux_session:
             lines.append(
-                f"  tmux: {session.attachment.tmux_session}"
-                f":{session.attachment.tmux_window}"
+                f"  tmux: {session.attachment.tmux_session}:{session.attachment.tmux_window}"
             )
         if session.research_progress:
             rp = session.research_progress
@@ -307,15 +311,11 @@ class DashboardScreen(BaseScreen):
 
         if inside_tmux:
             # switch-client works from within tmux without nesting issues
-            subprocess.call(
-                ["tmux", "switch-client", "-t", self._selected_tmux_target]
-            )
+            subprocess.call(["tmux", "switch-client", "-t", self._selected_tmux_target])
         else:
             # Suspend TUI, attach to tmux (blocking), then resume TUI
             with self.app.suspend():
-                subprocess.call(
-                    ["tmux", "attach-session", "-t", self._selected_tmux_target]
-                )
+                subprocess.call(["tmux", "attach-session", "-t", self._selected_tmux_target])
 
     def action_stop_session(self) -> None:
         """Stop the selected session."""
@@ -329,9 +329,7 @@ class DashboardScreen(BaseScreen):
             return
 
         try:
-            session = await self.ctx.session_service.stop_session(
-                self._selected_session_id
-            )
+            session = await self.ctx.session_service.stop_session(self._selected_session_id)
         except Exception as e:
             self.notify(f"Error stopping session: {e}", severity="error")
             return
@@ -365,9 +363,7 @@ class DashboardScreen(BaseScreen):
             return
 
         try:
-            session = await self.ctx.session_service.get_session(
-                self._selected_session_id
-            )
+            session = await self.ctx.session_service.get_session(self._selected_session_id)
         except Exception as e:
             self.notify(f"Error: {e}", severity="error")
             return
@@ -378,15 +374,11 @@ class DashboardScreen(BaseScreen):
 
         try:
             if session.lifecycle.value == "running":
-                result = await self.ctx.session_service.pause_session(
-                    self._selected_session_id
-                )
+                result = await self.ctx.session_service.pause_session(self._selected_session_id)
                 if result:
                     self.notify(f"Paused: {result.display_name}")
             elif session.lifecycle.value == "paused":
-                result = await self.ctx.session_service.resume_session(
-                    self._selected_session_id
-                )
+                result = await self.ctx.session_service.resume_session(self._selected_session_id)
                 if result:
                     self.notify(f"Resumed: {result.display_name}")
             else:
@@ -415,9 +407,7 @@ class DashboardScreen(BaseScreen):
             return
 
         try:
-            session = await self.ctx.session_service.archive_session(
-                self._selected_session_id
-            )
+            session = await self.ctx.session_service.archive_session(self._selected_session_id)
         except Exception as e:
             self.notify(f"Error archiving session: {e}", severity="error")
             return
@@ -438,9 +428,7 @@ class DashboardScreen(BaseScreen):
             return
 
         try:
-            task = await self.ctx.task_service.get_task_by_id(
-                self._selected_task_id
-            )
+            task = await self.ctx.task_service.get_task_by_id(self._selected_task_id)
             if not task:
                 self.notify("Task not found", severity="error")
                 return
@@ -467,9 +455,7 @@ class DashboardScreen(BaseScreen):
         if self._selected_session_id:
             from agentbenchplatform.ui.screens.session_detail import SessionDetailScreen
 
-            self.app.push_screen(
-                SessionDetailScreen(session_id=self._selected_session_id)
-            )
+            self.app.push_screen(SessionDetailScreen(session_id=self._selected_session_id))
         elif self._selected_task_id:
             from agentbenchplatform.ui.screens.task_detail import TaskDetailScreen
 
@@ -517,34 +503,42 @@ class DashboardScreen(BaseScreen):
 
     def action_coordinator(self) -> None:
         from agentbenchplatform.ui.screens.coordinator_chat import CoordinatorChatScreen
+
         self.app.push_screen(CoordinatorChatScreen())
 
     def action_research(self) -> None:
         from agentbenchplatform.ui.screens.research_monitor import ResearchMonitorScreen
+
         self.app.push_screen(ResearchMonitorScreen())
 
     def action_workspaces(self) -> None:
         from agentbenchplatform.ui.screens.workspaces import WorkspacesScreen
+
         self.app.push_screen(WorkspacesScreen())
 
     def action_memory(self) -> None:
         from agentbenchplatform.ui.screens.memory_browser import MemoryBrowserScreen
+
         self.app.push_screen(MemoryBrowserScreen())
 
     def action_file_browser(self) -> None:
         from agentbenchplatform.ui.screens.file_browser import FileBrowserScreen
+
         self.app.push_screen(FileBrowserScreen())
 
     def action_usage(self) -> None:
         from agentbenchplatform.ui.screens.usage_monitor import UsageMonitorScreen
+
         self.app.push_screen(UsageMonitorScreen())
 
     def action_db_explorer(self) -> None:
         from agentbenchplatform.ui.screens.db_explorer import DatabaseExplorerScreen
+
         self.app.push_screen(DatabaseExplorerScreen())
 
     def action_mcp(self) -> None:
         from agentbenchplatform.ui.screens.mcp_placeholder import McpPlaceholderScreen
+
         self.app.push_screen(McpPlaceholderScreen())
 
     def on_tools_menu_selected(self, event: ToolsMenu.Selected) -> None:

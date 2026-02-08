@@ -73,12 +73,19 @@ class LlamaCppProvider:
                     arguments=args,
                 ))
 
+        # Map OpenAI-style usage keys to expected format
+        raw_usage = data.get("usage", {})
+        usage = {
+            "input_tokens": raw_usage.get("prompt_tokens", 0),
+            "output_tokens": raw_usage.get("completion_tokens", 0),
+        }
+
         return LLMResponse(
             content=message.get("content", "") or "",
             model=data.get("model", ""),
             finish_reason=choice.get("finish_reason", ""),
             tool_calls=tool_calls,
-            usage=data.get("usage", {}),
+            usage=usage,
         )
 
     async def stream(

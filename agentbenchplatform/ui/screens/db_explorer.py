@@ -43,6 +43,16 @@ class DatabaseExplorerScreen(BaseScreen):
             detail.write("Not connected to MongoDB.")
             return
 
+        # Check if we have direct MongoDB access (not available via RemoteContext)
+        if not hasattr(self.ctx, "mongo"):
+            detail = self.query_one("#db-detail", RichLog)
+            detail.clear()
+            detail.write("Database Explorer requires direct database access.")
+            detail.write("")
+            detail.write("This feature is not available when connecting via RPC.")
+            detail.write("The dashboard is running in client mode.")
+            return
+
         tree = self.query_one("#db-tree", Tree)
         tree.root.remove_children()
 
