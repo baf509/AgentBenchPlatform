@@ -6,9 +6,12 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from agentbenchplatform.infra.rpc.serialization import (
+    serialize_agent_event,
+    serialize_coordinator_decision,
     serialize_dashboard_snapshot,
     serialize_memory,
     serialize_session,
+    serialize_session_report,
     serialize_task,
     serialize_usage,
     serialize_workspace,
@@ -70,6 +73,7 @@ class MethodRegistry:
         self._methods["memory.list"] = self._memory_list
         self._methods["memory.search"] = self._memory_search
         self._methods["memory.store"] = self._memory_store
+        self._methods["memory.delete"] = self._memory_delete
 
         # Usage
         self._methods["usage.aggregate_recent"] = self._usage_aggregate_recent
@@ -80,16 +84,56 @@ class MethodRegistry:
         self._methods["workspace.find_by_path"] = self._workspace_find_by_path
         self._methods["workspace.insert"] = self._workspace_insert
         self._methods["workspace.delete"] = self._workspace_delete
+        self._methods["workspace.list_all"] = self._workspace_list_all
+
+        # DB Explorer
+        self._methods["db.list_databases"] = self._db_list_databases
+        self._methods["db.list_collections"] = self._db_list_collections
+        self._methods["db.collection_info"] = self._db_collection_info
+        self._methods["db.collection_indexes"] = self._db_collection_indexes
+        self._methods["db.collection_search_indexes"] = self._db_collection_search_indexes
 
         # Signal
         self._methods["signal.start"] = self._signal_start
         self._methods["signal.stop"] = self._signal_stop
         self._methods["signal.status"] = self._signal_status
+        self._methods["signal.is_running"] = self._signal_is_running
         self._methods["signal.pair_sender"] = self._signal_pair_sender
+
+        # Session Reports
+        self._methods["session_report.get"] = self._session_report_get
+        self._methods["session_report.list_by_task"] = self._session_report_list_by_task
+
+        # Agent Events
+        self._methods["agent_event.list_unacknowledged"] = self._agent_event_list_unacknowledged
+        self._methods["agent_event.acknowledge"] = self._agent_event_acknowledge
+        self._methods["agent_event.list_by_session"] = self._agent_event_list_by_session
+
+        # Coordinator Decisions
+        self._methods["coordinator_decision.list_recent"] = self._coordinator_decision_list_recent
 
         # Coordinator history
         self._methods["coordinator_history.list_conversations"] = self._ch_list
         self._methods["coordinator_history.load_conversation"] = self._ch_load
+
+    @staticmethod
+    def _validate_str(params: dict, key: str, required: bool = True) -> None:
+        """Validate that a string param exists and is non-empty."""
+        val = params.get(key)
+        if required and (val is None or not isinstance(val, str) or not val.strip()):
+            raise ValueError(f"Missing or empty required parameter: {key}")
+
+    @staticmethod
+    def _validate_tags(params: dict, key: str = "tags", max_count: int = 20, max_len: int = 100) -> None:
+        """Validate tags list is reasonable."""
+        tags = params.get(key, [])
+        if not isinstance(tags, list):
+            raise ValueError(f"{key} must be a list")
+        if len(tags) > max_count:
+            raise ValueError(f"Too many {key} (max {max_count})")
+        for t in tags:
+            if not isinstance(t, str) or len(t) > max_len:
+                raise ValueError(f"Invalid tag: must be a string of at most {max_len} chars")
 
     async def dispatch(self, method: str, params: dict) -> Any:
         """Dispatch an RPC method call. Returns serializable result."""
@@ -130,6 +174,8 @@ class MethodRegistry:
         return serialize_task(task) if task else None
 
     async def _task_create(self, params: dict) -> dict:
+        self._validate_str(params, "title")
+        self._validate_tags(params)
         task = await self._ctx.task_service.create_task(
             title=params["title"],
             description=params.get("description", ""),
@@ -160,6 +206,7 @@ class MethodRegistry:
         return serialize_session(session) if session else None
 
     async def _session_start_coding(self, params: dict) -> dict:
+        self._validate_str(params, "task_id")
         session = await self._ctx.session_service.start_coding_session(
             task_id=params["task_id"],
             agent_type=params.get("agent_type", ""),
@@ -269,6 +316,8 @@ class MethodRegistry:
         return [serialize_memory(m) for m in results]
 
     async def _memory_store(self, params: dict) -> dict:
+        self._validate_str(params, "key")
+        self._validate_str(params, "content")
         scope = MemoryScope(params.get("scope", "global"))
         entry = await self._ctx.memory_service.store(
             key=params["key"],
@@ -280,6 +329,9 @@ class MethodRegistry:
             metadata=params.get("metadata"),
         )
         return serialize_memory(entry)
+
+    async def _memory_delete(self, params: dict) -> bool:
+        return await self._ctx.memory_service.delete_memory(params["memory_id"])
 
     # --- Usage ---
 
@@ -316,6 +368,43 @@ class MethodRegistry:
     async def _workspace_delete(self, params: dict) -> bool:
         return await self._ctx.workspace_repo.delete(params["workspace_id"])
 
+    async def _workspace_list_all(self, params: dict) -> list[dict]:
+        workspaces = await self._ctx.workspace_repo.list_all()
+        return [serialize_workspace(ws) for ws in workspaces]
+
+    # --- DB Explorer ---
+
+    async def _db_list_databases(self, params: dict) -> list[str]:
+        return await self._ctx.mongo.client.list_database_names()
+
+    async def _db_list_collections(self, params: dict) -> list[str]:
+        db_name = params["db_name"]
+        db = self._ctx.mongo.client[db_name]
+        return await db.list_collection_names()
+
+    async def _db_collection_info(self, params: dict) -> dict:
+        db = self._ctx.mongo.client[params["db_name"]]
+        coll = db[params["collection_name"]]
+        try:
+            doc_count = await coll.estimated_document_count()
+        except Exception:
+            doc_count = -1
+        return {"doc_count": doc_count}
+
+    async def _db_collection_indexes(self, params: dict) -> dict:
+        db = self._ctx.mongo.client[params["db_name"]]
+        coll = db[params["collection_name"]]
+        return await coll.index_information()
+
+    async def _db_collection_search_indexes(self, params: dict) -> list[dict]:
+        db = self._ctx.mongo.client[params["db_name"]]
+        try:
+            result = await db.command({"listSearchIndexes": params["collection_name"]})
+            cursor = result.get("cursor", {})
+            return cursor.get("firstBatch", [])
+        except Exception:
+            return []
+
     # --- Signal ---
 
     async def _signal_start(self, params: dict) -> str:
@@ -329,9 +418,52 @@ class MethodRegistry:
     async def _signal_status(self, params: dict) -> dict:
         return await self._ctx.signal_service.status()
 
+    async def _signal_is_running(self, params: dict) -> bool:
+        return self._ctx.signal_service.is_running
+
     async def _signal_pair_sender(self, params: dict) -> str:
         await self._ctx.signal_service.pair_sender(params["phone"])
         return "paired"
+
+    # --- Session Reports ---
+
+    async def _session_report_get(self, params: dict) -> dict | None:
+        report = await self._ctx.session_report_repo.find_by_session(params["session_id"])
+        return serialize_session_report(report) if report else None
+
+    async def _session_report_list_by_task(self, params: dict) -> list[dict]:
+        reports = await self._ctx.session_report_repo.list_by_task(
+            task_id=params["task_id"],
+            limit=params.get("limit", 20),
+        )
+        return [serialize_session_report(r) for r in reports]
+
+    # --- Agent Events ---
+
+    async def _agent_event_list_unacknowledged(self, params: dict) -> list[dict]:
+        events = await self._ctx.agent_event_repo.list_unacknowledged(
+            event_types=params.get("event_types"),
+            limit=params.get("limit", 50),
+        )
+        return [serialize_agent_event(e) for e in events]
+
+    async def _agent_event_acknowledge(self, params: dict) -> int:
+        return await self._ctx.agent_event_repo.acknowledge(params["event_ids"])
+
+    async def _agent_event_list_by_session(self, params: dict) -> list[dict]:
+        events = await self._ctx.agent_event_repo.list_by_session(
+            session_id=params["session_id"],
+            limit=params.get("limit", 50),
+        )
+        return [serialize_agent_event(e) for e in events]
+
+    # --- Coordinator Decisions ---
+
+    async def _coordinator_decision_list_recent(self, params: dict) -> list[dict]:
+        decisions = await self._ctx.coordinator_decision_repo.list_recent(
+            limit=params.get("limit", 20),
+        )
+        return [serialize_coordinator_decision(d) for d in decisions]
 
     # --- Coordinator History ---
 

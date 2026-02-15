@@ -11,8 +11,12 @@ from agentbenchplatform.infra.db.client import MongoClient
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from agentbenchplatform.infra.db.agent_events import AgentEventRepo
+    from agentbenchplatform.infra.db.conversation_summaries import ConversationSummaryRepo
+    from agentbenchplatform.infra.db.coordinator_decisions import CoordinatorDecisionRepo
     from agentbenchplatform.infra.db.coordinator_history import CoordinatorHistoryRepo
     from agentbenchplatform.infra.db.memory import MemoryRepo
+    from agentbenchplatform.infra.db.session_reports import SessionReportRepo
     from agentbenchplatform.infra.db.sessions import SessionRepo
     from agentbenchplatform.infra.db.tasks import TaskRepo
     from agentbenchplatform.infra.db.usage import UsageRepo
@@ -45,6 +49,10 @@ class AppContext:
         self._usage_repo: UsageRepo | None = None
         self._workspace_repo: WorkspaceRepo | None = None
         self._coordinator_history_repo: CoordinatorHistoryRepo | None = None
+        self._session_report_repo: SessionReportRepo | None = None
+        self._coordinator_decision_repo: CoordinatorDecisionRepo | None = None
+        self._conversation_summary_repo: ConversationSummaryRepo | None = None
+        self._agent_event_repo: AgentEventRepo | None = None
         self._task_service: TaskService | None = None
         self._session_service: SessionService | None = None
         self._memory_service: MemoryService | None = None
@@ -67,7 +75,19 @@ class AppContext:
         logger.info("AppContext initialized")
 
     async def close(self) -> None:
-        """Close all connections."""
+        """Close all connections and HTTP clients."""
+        # Stop coordinator watchdog before closing providers
+        if self._coordinator_service is not None:
+            self._coordinator_service.stop_watchdog()
+        if self._embedding_service:
+            await self._embedding_service.close()
+        # Close any provider HTTP clients that support close()
+        for attr in ("_coordinator_service", "_research_service"):
+            svc = getattr(self, attr, None)
+            if svc is not None:
+                provider = getattr(svc, "_provider", None)
+                if provider is not None and hasattr(provider, "close"):
+                    await provider.close()
         if self._mongo:
             self._mongo.close()
         logger.info("AppContext closed")
@@ -127,6 +147,38 @@ class AppContext:
         return self._coordinator_history_repo
 
     @property
+    def session_report_repo(self) -> SessionReportRepo:
+        if self._session_report_repo is None:
+            from agentbenchplatform.infra.db.session_reports import SessionReportRepo
+
+            self._session_report_repo = SessionReportRepo(self.mongo.db)
+        return self._session_report_repo
+
+    @property
+    def coordinator_decision_repo(self) -> CoordinatorDecisionRepo:
+        if self._coordinator_decision_repo is None:
+            from agentbenchplatform.infra.db.coordinator_decisions import CoordinatorDecisionRepo
+
+            self._coordinator_decision_repo = CoordinatorDecisionRepo(self.mongo.db)
+        return self._coordinator_decision_repo
+
+    @property
+    def conversation_summary_repo(self) -> ConversationSummaryRepo:
+        if self._conversation_summary_repo is None:
+            from agentbenchplatform.infra.db.conversation_summaries import ConversationSummaryRepo
+
+            self._conversation_summary_repo = ConversationSummaryRepo(self.mongo.db)
+        return self._conversation_summary_repo
+
+    @property
+    def agent_event_repo(self) -> AgentEventRepo:
+        if self._agent_event_repo is None:
+            from agentbenchplatform.infra.db.agent_events import AgentEventRepo
+
+            self._agent_event_repo = AgentEventRepo(self.mongo.db)
+        return self._agent_event_repo
+
+    @property
     def task_service(self) -> TaskService:
         if self._task_service is None:
             from agentbenchplatform.services.task_service import TaskService
@@ -143,6 +195,7 @@ class AppContext:
                 session_repo=self.session_repo,
                 config=self.config,
                 task_repo=self.task_repo,
+                memory_service=self.memory_service,
             )
         return self._session_service
 
@@ -204,6 +257,10 @@ class AppContext:
                 research_service=self.research_service,
                 usage_repo=self.usage_repo,
                 history_repo=self.coordinator_history_repo,
+                session_report_repo=self.session_report_repo,
+                coordinator_decision_repo=self.coordinator_decision_repo,
+                conversation_summary_repo=self.conversation_summary_repo,
+                agent_event_repo=self.agent_event_repo,
             )
         return self._coordinator_service
 

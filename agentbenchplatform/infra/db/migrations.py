@@ -44,6 +44,44 @@ async def run_migrations(db) -> None:
         [("channel", pymongo.ASCENDING), ("created_at", pymongo.DESCENDING)]
     )
 
+    # Session reports indexes
+    session_reports = db["session_reports"]
+    await session_reports.create_index([("session_id", pymongo.ASCENDING)], unique=True)
+    await session_reports.create_index(
+        [("task_id", pymongo.ASCENDING), ("created_at", pymongo.DESCENDING)]
+    )
+
+    # Coordinator decisions indexes
+    coordinator_decisions = db["coordinator_decisions"]
+    await coordinator_decisions.create_index(
+        [("conversation_key", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)]
+    )
+    await coordinator_decisions.create_index([("timestamp", pymongo.DESCENDING)])
+
+    # Conversation summaries indexes
+    conversation_summaries = db["conversation_summaries"]
+    await conversation_summaries.create_index(
+        [("conversation_key", pymongo.ASCENDING), ("superseded_by", pymongo.ASCENDING)]
+    )
+
+    # Agent events indexes
+    agent_events = db["agent_events"]
+    await agent_events.create_index(
+        [("session_id", pymongo.ASCENDING), ("created_at", pymongo.DESCENDING)]
+    )
+    await agent_events.create_index(
+        [("acknowledged", pymongo.ASCENDING), ("event_type", pymongo.ASCENDING)]
+    )
+
+    # Additional usage_events indexes
+    usage_events = db["usage_events"]
+    await usage_events.create_index(
+        [("source", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)]
+    )
+    await usage_events.create_index(
+        [("task_id", pymongo.ASCENDING), ("source", pymongo.ASCENDING)]
+    )
+
     logger.info("MongoDB migrations complete")
 
 

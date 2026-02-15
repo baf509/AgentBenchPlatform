@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from agentbenchplatform.models.agent_event import AgentEvent, AgentEventType
+from agentbenchplatform.models.coordinator_decision import CoordinatorDecision, ToolCallRecord
 from agentbenchplatform.models.memory import MemoryEntry, MemoryScope
 from agentbenchplatform.models.session import (
     ResearchProgress,
@@ -13,6 +15,7 @@ from agentbenchplatform.models.session import (
     SessionKind,
     SessionLifecycle,
 )
+from agentbenchplatform.models.session_report import DiffStats, SessionReport, TestResults
 from agentbenchplatform.models.task import Task, TaskStatus
 from agentbenchplatform.models.usage import UsageEvent
 from agentbenchplatform.models.workspace import Workspace
@@ -306,4 +309,100 @@ def deserialize_workspace_snapshot(data: dict) -> Any:
         standalone=data.get("standalone", False),
         workspace_id=data.get("workspace_id"),
         display_name=data.get("display_name", ""),
+    )
+
+
+# --- Session Report ---
+
+def serialize_session_report(report: SessionReport) -> dict:
+    return {
+        "session_id": report.session_id,
+        "task_id": report.task_id,
+        "agent": report.agent,
+        "status": report.status,
+        "summary": report.summary,
+        "files_changed": list(report.files_changed),
+        "test_results": report.test_results.to_doc() if report.test_results else None,
+        "diff_stats": report.diff_stats.to_doc() if report.diff_stats else None,
+        "agent_notes": report.agent_notes,
+        "created_at": _dt_to_str(report.created_at),
+        "id": report.id,
+    }
+
+
+def deserialize_session_report(data: dict) -> SessionReport:
+    tr = data.get("test_results")
+    ds = data.get("diff_stats")
+    return SessionReport(
+        session_id=data["session_id"],
+        task_id=data["task_id"],
+        agent=data.get("agent", ""),
+        status=data.get("status", "unknown"),
+        summary=data.get("summary", ""),
+        files_changed=tuple(data.get("files_changed", [])),
+        test_results=TestResults.from_doc(tr) if tr else None,
+        diff_stats=DiffStats.from_doc(ds) if ds else None,
+        agent_notes=data.get("agent_notes", ""),
+        created_at=_str_to_dt(data.get("created_at")) or datetime.now(timezone.utc),
+        id=data.get("id"),
+    )
+
+
+# --- Agent Event ---
+
+def serialize_agent_event(event: AgentEvent) -> dict:
+    return {
+        "session_id": event.session_id,
+        "task_id": event.task_id,
+        "event_type": event.event_type.value,
+        "detail": event.detail,
+        "acknowledged": event.acknowledged,
+        "created_at": _dt_to_str(event.created_at),
+        "id": event.id,
+    }
+
+
+def deserialize_agent_event(data: dict) -> AgentEvent:
+    return AgentEvent(
+        session_id=data["session_id"],
+        task_id=data.get("task_id", ""),
+        event_type=AgentEventType(data["event_type"]),
+        detail=data.get("detail", ""),
+        acknowledged=data.get("acknowledged", False),
+        created_at=_str_to_dt(data.get("created_at")) or datetime.now(timezone.utc),
+        id=data.get("id"),
+    )
+
+
+# --- Coordinator Decision ---
+
+def serialize_coordinator_decision(decision: CoordinatorDecision) -> dict:
+    return {
+        "conversation_key": decision.conversation_key,
+        "turn_number": decision.turn_number,
+        "user_input": decision.user_input,
+        "tools_called": [tc.to_doc() for tc in decision.tools_called],
+        "reasoning_excerpt": decision.reasoning_excerpt,
+        "final_response": decision.final_response,
+        "tokens": decision.tokens,
+        "model": decision.model,
+        "timestamp": _dt_to_str(decision.timestamp),
+        "id": decision.id,
+    }
+
+
+def deserialize_coordinator_decision(data: dict) -> CoordinatorDecision:
+    return CoordinatorDecision(
+        conversation_key=data["conversation_key"],
+        turn_number=data.get("turn_number", 0),
+        user_input=data.get("user_input", ""),
+        tools_called=tuple(
+            ToolCallRecord.from_doc(tc) for tc in data.get("tools_called", [])
+        ),
+        reasoning_excerpt=data.get("reasoning_excerpt", ""),
+        final_response=data.get("final_response", ""),
+        tokens=data.get("tokens", {}),
+        model=data.get("model", ""),
+        timestamp=_str_to_dt(data.get("timestamp")) or datetime.now(timezone.utc),
+        id=data.get("id"),
     )

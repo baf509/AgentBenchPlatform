@@ -7,9 +7,12 @@ from typing import Any
 
 from agentbenchplatform.infra.rpc.client import RpcClient
 from agentbenchplatform.infra.rpc.serialization import (
+    deserialize_agent_event,
+    deserialize_coordinator_decision,
     deserialize_dashboard_snapshot,
     deserialize_memory,
     deserialize_session,
+    deserialize_session_report,
     deserialize_task,
     deserialize_usage,
     deserialize_workspace,
@@ -38,7 +41,11 @@ class RemoteContext:
         self._signal_service: RemoteSignalService | None = None
         self._usage_repo: RemoteUsageRepo | None = None
         self._coordinator_history_repo: RemoteCoordinatorHistoryRepo | None = None
+        self._session_report_repo: RemoteSessionReportRepo | None = None
+        self._agent_event_repo: RemoteAgentEventRepo | None = None
+        self._coordinator_decision_repo: RemoteCoordinatorDecisionRepo | None = None
         self._workspace_repo: RemoteWorkspaceRepo | None = None
+        self._db_explorer: RemoteDbExplorer | None = None
 
     async def initialize(self) -> None:
         """Connect to the server and verify it's running."""
@@ -102,10 +109,34 @@ class RemoteContext:
         return self._coordinator_history_repo
 
     @property
+    def session_report_repo(self) -> RemoteSessionReportRepo:
+        if self._session_report_repo is None:
+            self._session_report_repo = RemoteSessionReportRepo(self._client)
+        return self._session_report_repo
+
+    @property
+    def agent_event_repo(self) -> RemoteAgentEventRepo:
+        if self._agent_event_repo is None:
+            self._agent_event_repo = RemoteAgentEventRepo(self._client)
+        return self._agent_event_repo
+
+    @property
+    def coordinator_decision_repo(self) -> RemoteCoordinatorDecisionRepo:
+        if self._coordinator_decision_repo is None:
+            self._coordinator_decision_repo = RemoteCoordinatorDecisionRepo(self._client)
+        return self._coordinator_decision_repo
+
+    @property
     def workspace_repo(self) -> RemoteWorkspaceRepo:
         if self._workspace_repo is None:
             self._workspace_repo = RemoteWorkspaceRepo(self._client)
         return self._workspace_repo
+
+    @property
+    def db_explorer(self) -> RemoteDbExplorer:
+        if self._db_explorer is None:
+            self._db_explorer = RemoteDbExplorer(self._client)
+        return self._db_explorer
 
 
 class RemoteTaskService:
@@ -285,9 +316,7 @@ class RemoteMemoryService:
         return [deserialize_memory(m) for m in data]
 
     async def delete_memory(self, memory_id: str) -> bool:
-        # Memory delete isn't in our RPC methods yet, but we can add it
-        # For now, raise not implemented
-        raise NotImplementedError("Memory delete via RPC not yet supported")
+        return await self._client.call("memory.delete", memory_id=memory_id)
 
 
 class RemoteSignalService:
@@ -308,10 +337,10 @@ class RemoteSignalService:
     async def pair_sender(self, phone: str) -> None:
         await self._client.call("signal.pair_sender", phone=phone)
 
-    @property
-    def is_running(self) -> bool:
-        # Can't check synchronously; caller should use status() instead
-        return False
+    async def is_running(self) -> bool:
+        """Check if the signal daemon is running via RPC."""
+        result = await self._client.call("signal.is_running")
+        return bool(result)
 
 
 class RemoteUsageRepo:
@@ -359,6 +388,34 @@ class RemoteCoordinatorHistoryRepo:
         ]
 
 
+class RemoteDbExplorer:
+    """Proxy for DB Explorer operations over RPC."""
+
+    def __init__(self, client: RpcClient) -> None:
+        self._client = client
+
+    async def list_databases(self) -> list[str]:
+        return await self._client.call("db.list_databases")
+
+    async def list_collections(self, db_name: str) -> list[str]:
+        return await self._client.call("db.list_collections", db_name=db_name)
+
+    async def collection_info(self, db_name: str, collection_name: str) -> dict:
+        return await self._client.call(
+            "db.collection_info", db_name=db_name, collection_name=collection_name,
+        )
+
+    async def collection_indexes(self, db_name: str, collection_name: str) -> dict:
+        return await self._client.call(
+            "db.collection_indexes", db_name=db_name, collection_name=collection_name,
+        )
+
+    async def collection_search_indexes(self, db_name: str, collection_name: str) -> list[dict]:
+        return await self._client.call(
+            "db.collection_search_indexes", db_name=db_name, collection_name=collection_name,
+        )
+
+
 class RemoteWorkspaceRepo:
     """Proxy for WorkspaceRepo over RPC."""
 
@@ -376,9 +433,66 @@ class RemoteWorkspaceRepo:
         return deserialize_workspace(data)
 
     async def list_all(self) -> list:
-        # list_all isn't directly exposed as an RPC method; use dashboard.workspaces
-        # or add it. For now, return empty.
-        return []
+        data = await self._client.call("workspace.list_all")
+        return [deserialize_workspace(ws) for ws in data]
 
     async def delete(self, workspace_id: str) -> bool:
         return await self._client.call("workspace.delete", workspace_id=workspace_id)
+
+
+class RemoteSessionReportRepo:
+    """Proxy for SessionReportRepo over RPC."""
+
+    def __init__(self, client: RpcClient) -> None:
+        self._client = client
+
+    async def find_by_session(self, session_id: str) -> Any:
+        data = await self._client.call("session_report.get", session_id=session_id)
+        return deserialize_session_report(data) if data else None
+
+    async def list_by_task(self, task_id: str, limit: int = 20) -> list:
+        data = await self._client.call(
+            "session_report.list_by_task", task_id=task_id, limit=limit,
+        )
+        return [deserialize_session_report(r) for r in data]
+
+
+class RemoteAgentEventRepo:
+    """Proxy for AgentEventRepo over RPC."""
+
+    def __init__(self, client: RpcClient) -> None:
+        self._client = client
+
+    async def list_unacknowledged(
+        self, event_types: list[str] | None = None, limit: int = 50
+    ) -> list:
+        data = await self._client.call(
+            "agent_event.list_unacknowledged",
+            event_types=event_types, limit=limit,
+        )
+        return [deserialize_agent_event(e) for e in data]
+
+    async def acknowledge(self, event_ids: list[str]) -> int:
+        return await self._client.call(
+            "agent_event.acknowledge", event_ids=event_ids,
+        )
+
+    async def list_by_session(self, session_id: str, limit: int = 50) -> list:
+        data = await self._client.call(
+            "agent_event.list_by_session",
+            session_id=session_id, limit=limit,
+        )
+        return [deserialize_agent_event(e) for e in data]
+
+
+class RemoteCoordinatorDecisionRepo:
+    """Proxy for CoordinatorDecisionRepo over RPC."""
+
+    def __init__(self, client: RpcClient) -> None:
+        self._client = client
+
+    async def list_recent(self, limit: int = 20) -> list:
+        data = await self._client.call(
+            "coordinator_decision.list_recent", limit=limit,
+        )
+        return [deserialize_coordinator_decision(d) for d in data]

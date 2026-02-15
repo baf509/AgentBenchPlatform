@@ -57,6 +57,10 @@ def server_start(foreground: bool):
                 except Exception as e:
                     click.echo(f"Signal auto-start failed: {e}", err=True)
 
+            # Start coordinator watchdog
+            ctx.coordinator_service.start_watchdog()
+            click.echo("Coordinator watchdog started")
+
             click.echo("Server ready")
 
             # Wait for shutdown signal
