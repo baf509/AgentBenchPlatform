@@ -50,11 +50,12 @@ api_key_env = "OPENROUTER_API_KEY"
 default_model = "anthropic/claude-sonnet-4"
 
 [providers.llamacpp]
-base_url = "http://localhost:8080"
+base_url = "http://localhost:8012"
+opencode_model = "llama.cpp/step3p5-flash"
 
 [embeddings]
 provider = "llamacpp"
-base_url = "http://localhost:8080"
+base_url = "http://localhost:8012"
 dimensions = 768
 
 [coordinator]
@@ -99,12 +100,13 @@ class ProviderConfig:
     api_key: str = ""
     default_model: str = ""
     base_url: str = ""
+    opencode_model: str = ""
 
 
 @dataclass
 class EmbeddingsConfig:
     provider: str = "llamacpp"
-    base_url: str = "http://localhost:8080"
+    base_url: str = "http://localhost:8012"
     dimensions: int = 768
 
 
@@ -195,6 +197,7 @@ def _parse_provider(data: dict) -> ProviderConfig:
         api_key_env=data.get("api_key_env", ""),
         default_model=data.get("default_model", ""),
         base_url=data.get("base_url", ""),
+        opencode_model=data.get("opencode_model", ""),
     )
 
 
@@ -229,7 +232,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         providers={name: _parse_provider(data) for name, data in providers_raw.items()},
         embeddings=EmbeddingsConfig(
             provider=embeddings_raw.get("provider", "llamacpp"),
-            base_url=embeddings_raw.get("base_url", "http://localhost:8080"),
+            base_url=embeddings_raw.get("base_url", "http://localhost:8012"),
             dimensions=embeddings_raw.get("dimensions", 768),
         ),
         coordinator=CoordinatorConfig(

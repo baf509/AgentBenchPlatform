@@ -121,8 +121,8 @@ def research_results(task_slug: str):
 
             if learnings:
                 click.echo(f"=== Learnings ({len(learnings)}) ===")
-                for l in learnings:
-                    click.echo(f"  - {l.content[:150]}")
+                for lr in learnings:
+                    click.echo(f"  - {lr.content[:150]}")
         finally:
             await ctx.close()
 

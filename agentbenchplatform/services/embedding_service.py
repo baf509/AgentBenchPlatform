@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
 from agentbenchplatform.config import EmbeddingsConfig
 
 logger = logging.getLogger(__name__)
+
+_RETRY_INTERVAL = 60.0  # seconds before retrying after a connection failure
 
 
 class EmbeddingService:
@@ -22,6 +25,7 @@ class EmbeddingService:
             timeout=60.0,
         )
         self._available: bool | None = None
+        self._unavailable_since: float = 0.0
 
     async def embed(self, text: str) -> list[float] | None:
         """Generate embedding for a single text.
@@ -37,7 +41,10 @@ class EmbeddingService:
         Returns None if embedding service is unavailable.
         """
         if self._available is False:
-            return None
+            if time.monotonic() - self._unavailable_since < _RETRY_INTERVAL:
+                return None
+            # TTL expired — retry
+            logger.debug("Retrying embedding service after cooldown")
 
         try:
             response = await self._client.post(
@@ -52,14 +59,21 @@ class EmbeddingService:
             if self._available is not False:
                 logger.warning(
                     "Embedding service unavailable at %s. "
-                    "Memories will be stored without embeddings.",
+                    "Memories will be stored without embeddings. "
+                    "Will retry in %ds.",
                     self._base_url,
+                    int(_RETRY_INTERVAL),
                 )
             self._available = False
+            self._unavailable_since = time.monotonic()
             return None
         except httpx.HTTPError as e:
             logger.error("Embedding request failed: %s", e)
             return None
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
 
     async def health_check(self) -> bool:
         """Check if the embedding service is reachable."""

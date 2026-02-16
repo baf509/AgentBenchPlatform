@@ -439,6 +439,7 @@ Config file: `~/.config/agentbenchplatform/config.toml`
 | `mongodb` | `database` | `agentbenchplatform` | Database name |
 | `providers.anthropic` | `api_key_env` | `ANTHROPIC_API_KEY` | Env var for API key |
 | `providers.openrouter` | `api_key_env` | `OPENROUTER_API_KEY` | Env var for API key |
+| `providers.llamacpp` | `opencode_model` | `llama.cpp/step3p5-flash` | Model string for OpenCode Local agent |
 | `embeddings` | `provider` | `llamacpp` | Embedding provider |
 | `embeddings` | `dimensions` | `768` | Vector dimensions |
 | `coordinator` | `provider` | `anthropic` | LLM provider for coordinator |
@@ -485,7 +486,7 @@ agentbenchplatform/
   infra/                    # IO and external integrations
     git.py                  # Git worktree create/remove
     subprocess_mgr.py       # tmux + process management
-    agents/                 # Agent backends (claude_code, opencode, claude_local)
+    agents/                 # Agent backends (claude_code, opencode, opencode_local)
     db/                     # MongoDB repos (Motor async), migrations
     providers/              # LLM providers (anthropic, openrouter, llamacpp)
     rpc/                    # JSON-RPC 2.0 server + client

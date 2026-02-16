@@ -44,7 +44,7 @@ def _build_provider(provider_type: ProviderType, config: AppConfig) -> LLMProvid
     elif provider_type == ProviderType.LLAMACPP:
         prov_config = config.providers.get("llamacpp")
         return LlamaCppProvider(
-            base_url=prov_config.base_url if prov_config else "http://localhost:8080",
+            base_url=prov_config.base_url if prov_config else "http://localhost:8012",
         )
     else:
         raise ValueError(f"Unknown provider type: {provider_type}")
@@ -90,7 +90,7 @@ def get_provider_with_fallback(config: AppConfig, primary: str = "") -> LLMProvi
         prov_config = config.providers.get(ptype.value)
         if ptype == ProviderType.LLAMACPP:
             # llama.cpp doesn't need an API key, but check if it's running
-            base_url = prov_config.base_url if prov_config else "http://localhost:8080"
+            base_url = prov_config.base_url if prov_config else "http://localhost:8012"
             if _check_llamacpp_available(base_url):
                 providers.append(_build_provider(ptype, config))
                 names.append(ptype.value)

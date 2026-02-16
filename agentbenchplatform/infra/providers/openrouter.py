@@ -32,6 +32,48 @@ class OpenRouterProvider:
             timeout=120.0,
         )
 
+    @staticmethod
+    def _convert_message(msg: LLMMessage) -> dict:
+        """Convert an LLMMessage to OpenAI-compatible format.
+
+        Handles the tool_calls format difference: internal format uses flat
+        {id, name, arguments: dict}, but OpenAI requires nested
+        {id, type, function: {name, arguments: json_string}}.
+        """
+        d = msg.to_dict()
+
+        if msg.tool_calls:
+            d["tool_calls"] = [
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name", ""),
+                        "arguments": json.dumps(tc.get("arguments", {})),
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+            # OpenAI expects null content when there are tool_calls with no text
+            if not msg.content:
+                d["content"] = None
+
+        # Strip 'name' from tool messages - not standard in OpenAI format
+        if msg.role == "tool" and "name" in d:
+            del d["name"]
+
+        return d
+
+    def _resolve_model(self, model: str) -> str:
+        """Use the given model if it looks like an OpenRouter model, else default.
+
+        OpenRouter models use 'provider/model' format (e.g. 'anthropic/claude-sonnet-4').
+        Local model names like 'foo.gguf' aren't valid here.
+        """
+        if model and "/" in model:
+            return model
+        return self._default_model
+
     async def complete(
         self,
         messages: list[LLMMessage],
@@ -39,11 +81,11 @@ class OpenRouterProvider:
     ) -> LLMResponse:
         """Generate a completion via OpenRouter."""
         config = config or LLMConfig()
-        model = config.model or self._default_model
+        model = self._resolve_model(config.model)
 
         payload: dict = {
             "model": model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": [self._convert_message(m) for m in messages],
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
         }
@@ -95,6 +137,10 @@ class OpenRouterProvider:
             usage=usage,
         )
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+
     async def stream(
         self,
         messages: list[LLMMessage],
@@ -102,11 +148,11 @@ class OpenRouterProvider:
     ) -> AsyncIterator[str]:
         """Stream a completion via OpenRouter."""
         config = config or LLMConfig()
-        model = config.model or self._default_model
+        model = self._resolve_model(config.model)
 
         payload: dict = {
             "model": model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": [self._convert_message(m) for m in messages],
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
             "stream": True,

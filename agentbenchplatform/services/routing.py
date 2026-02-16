@@ -11,7 +11,7 @@ _JUNIOR_KEYWORDS = re.compile(
 )
 
 _COMPLEXITY_TO_AGENT = {
-    "junior": "claude_local",
+    "junior": "opencode_local",
     "mid": "opencode",
     "senior": "claude_code",
 }
@@ -37,12 +37,12 @@ def recommend_agent(
     # Tag-based hints
     tag_set = frozenset(t.lower() for t in tags)
     if tag_set & _TAG_JUNIOR:
-        return "claude_local"
+        return "opencode_local"
     if tag_set & _TAG_SENIOR:
         return "claude_code"
 
     # Short prompt with simple-task keywords
     if prompt and len(prompt) < 100 and _JUNIOR_KEYWORDS.search(prompt):
-        return "claude_local"
+        return "opencode_local"
 
     return ""

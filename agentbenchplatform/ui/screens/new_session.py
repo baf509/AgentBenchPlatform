@@ -65,8 +65,8 @@ class NewSessionScreen(ModalScreen[bool]):
             yield Select(
                 [
                     ("Claude Code", "claude_code"),
-                    ("Claude Local (llama.cpp)", "claude_local"),
                     ("OpenCode", "opencode"),
+                    ("OpenCode Local (llama.cpp)", "opencode_local"),
                 ],
                 id="ns-agent-select",
                 value="claude_code",

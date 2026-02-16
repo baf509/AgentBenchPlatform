@@ -25,8 +25,8 @@ class TestResearchConfig:
 
 class TestLearning:
     def test_create(self):
-        l = Learning(content="JWT tokens are stateless", source_url="https://example.com")
-        assert l.content == "JWT tokens are stateless"
+        lr = Learning(content="JWT tokens are stateless", source_url="https://example.com")
+        assert lr.content == "JWT tokens are stateless"
 
     def test_empty_content_raises(self):
         with pytest.raises(ValueError, match="content cannot be empty"):

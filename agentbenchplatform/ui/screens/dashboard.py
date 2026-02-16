@@ -9,6 +9,7 @@ from textual.containers import Container, Vertical
 from textual.widgets import Footer, Static, Tree
 
 from agentbenchplatform.ui.screens.base import BaseScreen
+from agentbenchplatform.ui.screens.confirm_dialog import ConfirmDialog
 from agentbenchplatform.ui.widgets.header_bar import HeaderBar
 from agentbenchplatform.ui.widgets.log_viewer import LogViewer
 from agentbenchplatform.ui.widgets.task_tree import TaskTree
@@ -128,6 +129,8 @@ class DashboardScreen(BaseScreen):
         if not hasattr(app, "ctx") or app.ctx is None:
             return
 
+        vitals = self.query_one("#vitals-text", VitalsPanel)
+
         try:
             usage_totals = await app.ctx.usage_repo.aggregate_recent(hours=6)
 
@@ -145,10 +148,15 @@ class DashboardScreen(BaseScreen):
                 else:
                     last_coordinator_dt = updated_at
 
-            vitals = self.query_one("#vitals-text", VitalsPanel)
-            vitals.update_vitals(self._last_snapshot, usage_totals, last_coordinator_dt)
-        except Exception:
-            logger.debug("Error refreshing vitals", exc_info=True)
+            vitals.update_vitals(
+                self._last_snapshot, usage_totals, last_coordinator_dt, error=None
+            )
+        except Exception as e:
+            logger.warning("Error refreshing vitals", exc_info=True)
+            # Surface error in vitals panel
+            vitals.update_vitals(
+                self._last_snapshot, None, None, error=str(e)[:100]
+            )
 
     # --- Tree node selection ---
 
@@ -278,7 +286,6 @@ class DashboardScreen(BaseScreen):
         """
         import asyncio
         import os
-        import subprocess
 
         if not self._selected_session_id:
             self.notify("Select a session first", severity="warning")
@@ -311,11 +318,17 @@ class DashboardScreen(BaseScreen):
 
         if inside_tmux:
             # switch-client works from within tmux without nesting issues
-            subprocess.call(["tmux", "switch-client", "-t", self._selected_tmux_target])
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "switch-client", "-t", self._selected_tmux_target,
+            )
+            await proc.wait()
         else:
             # Suspend TUI, attach to tmux (blocking), then resume TUI
             with self.app.suspend():
-                subprocess.call(["tmux", "attach-session", "-t", self._selected_tmux_target])
+                proc = await asyncio.create_subprocess_exec(
+                    "tmux", "attach-session", "-t", self._selected_tmux_target,
+                )
+                await proc.wait()
 
     def action_stop_session(self) -> None:
         """Stop the selected session."""
@@ -394,11 +407,21 @@ class DashboardScreen(BaseScreen):
         await self._show_session_detail(self._selected_session_id)
 
     def action_delete(self) -> None:
-        """Delete the selected task or archive the selected session."""
+        """Delete the selected task or archive the selected session (with confirmation)."""
         if self._selected_session_id:
-            self.run_worker(self._archive_session())
+            self.app.push_screen(
+                ConfirmDialog("Archive this session?"),
+                callback=lambda confirmed: (
+                    self.run_worker(self._archive_session()) if confirmed else None
+                ),
+            )
         elif self._selected_task_id:
-            self.run_worker(self._delete_task())
+            self.app.push_screen(
+                ConfirmDialog("Delete this task and all its sessions?"),
+                callback=lambda confirmed: (
+                    self.run_worker(self._delete_task()) if confirmed else None
+                ),
+            )
         else:
             self.notify("Select a task or session first", severity="warning")
 
@@ -457,7 +480,6 @@ class DashboardScreen(BaseScreen):
 
             self.app.push_screen(SessionDetailScreen(session_id=self._selected_session_id))
         elif self._selected_task_id:
-            from agentbenchplatform.ui.screens.task_detail import TaskDetailScreen
 
             # Find the slug for the task ID
             self.run_worker(self._open_task_detail())

@@ -43,19 +43,106 @@ class DatabaseExplorerScreen(BaseScreen):
             detail.write("Not connected to MongoDB.")
             return
 
-        # Check if we have direct MongoDB access (not available via RemoteContext)
-        if not hasattr(self.ctx, "mongo"):
-            detail = self.query_one("#db-detail", RichLog)
-            detail.clear()
-            detail.write("Database Explorer requires direct database access.")
-            detail.write("")
-            detail.write("This feature is not available when connecting via RPC.")
-            detail.write("The dashboard is running in client mode.")
-            return
-
         tree = self.query_one("#db-tree", Tree)
         tree.root.remove_children()
 
+        # Use RPC-based db_explorer if available, fall back to direct mongo access
+        if hasattr(self.ctx, "db_explorer"):
+            await self._refresh_via_rpc(tree)
+        elif hasattr(self.ctx, "mongo"):
+            await self._refresh_direct(tree)
+        else:
+            detail = self.query_one("#db-detail", RichLog)
+            detail.clear()
+            detail.write("Database Explorer requires database access.")
+            return
+
+        tree.root.expand()
+
+    async def _refresh_via_rpc(self, tree: Tree) -> None:
+        """Populate tree using RPC calls (works in client mode)."""
+        try:
+            db_names = await self.ctx.db_explorer.list_databases()
+        except Exception:
+            logger.debug("Could not list databases via RPC", exc_info=True)
+            detail = self.query_one("#db-detail", RichLog)
+            detail.clear()
+            detail.write("Error listing databases. Check MongoDB connection.")
+            return
+
+        for db_name in sorted(db_names):
+            db_node = tree.root.add(f"{db_name}", data={"type": "database", "name": db_name})
+
+            try:
+                coll_names = await self.ctx.db_explorer.list_collections(db_name)
+            except Exception:
+                logger.debug("Could not list collections for %s", db_name, exc_info=True)
+                db_node.add_leaf("(error listing collections)")
+                continue
+
+            for coll_name in sorted(coll_names):
+                try:
+                    info = await self.ctx.db_explorer.collection_info(db_name, coll_name)
+                    doc_count = info.get("doc_count", "?")
+                except Exception:
+                    doc_count = "?"
+
+                coll_node = db_node.add(
+                    f"{coll_name} ({doc_count} docs)",
+                    data={
+                        "type": "collection",
+                        "db": db_name,
+                        "name": coll_name,
+                        "doc_count": doc_count,
+                    },
+                )
+
+                # Standard indexes
+                idx_node = coll_node.add("Indexes", data={"type": "indexes_group"})
+                try:
+                    indexes = await self.ctx.db_explorer.collection_indexes(db_name, coll_name)
+                    for idx_name, idx_info in sorted(indexes.items()):
+                        unique = " (unique)" if idx_info.get("unique") else ""
+                        idx_node.add_leaf(
+                            f"{idx_name}{unique}",
+                            data={
+                                "type": "index",
+                                "db": db_name,
+                                "collection": coll_name,
+                                "name": idx_name,
+                                "info": idx_info,
+                            },
+                        )
+                except Exception:
+                    idx_node.add_leaf("(error)")
+
+                # Search indexes
+                search_node = coll_node.add("Search Indexes", data={"type": "search_group"})
+                try:
+                    search_indexes = await self.ctx.db_explorer.collection_search_indexes(
+                        db_name, coll_name
+                    )
+                    if search_indexes:
+                        for si in search_indexes:
+                            si_name = si.get("name", "unnamed")
+                            si_type = si.get("type", "search")
+                            search_node.add_leaf(
+                                f"{si_name} ({si_type})",
+                                data={
+                                    "type": "search_index",
+                                    "db": db_name,
+                                    "collection": coll_name,
+                                    "name": si_name,
+                                    "definition": si,
+                                },
+                            )
+                    else:
+                        search_node.add_leaf("(none)")
+                except Exception:
+                    search_node.add_leaf("(not available)")
+
+    async def _refresh_direct(self, tree: Tree) -> None:
+        """Populate tree using direct MongoDB access (server-local mode)."""
         client = self.ctx.mongo.client
 
         try:
@@ -139,8 +226,6 @@ class DatabaseExplorerScreen(BaseScreen):
                 except Exception:
                     # listSearchIndexes requires Atlas or mongot — expected to fail locally
                     search_node.add_leaf("(not available)")
-
-        tree.root.expand()
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         """Show details for the selected tree node."""

@@ -21,9 +21,15 @@ class VitalsPanel(Static):
         snapshot: DashboardSnapshot | None,
         usage_totals: dict | None,
         last_coordinator_dt: datetime | None,
+        error: str | None = None,
     ) -> None:
         """Re-render vitals text from pre-fetched data."""
         lines: list[str] = []
+
+        # Show error state prominently
+        if error:
+            lines.append(f"⚠ Vitals Error: {error}")
+            lines.append("")
 
         # --- Sessions ---
         if snapshot:
@@ -76,6 +82,9 @@ class VitalsPanel(Static):
 
         # --- Last coordinator ---
         if last_coordinator_dt:
+            # Ensure timezone-aware comparison
+            if last_coordinator_dt.tzinfo is None:
+                last_coordinator_dt = last_coordinator_dt.replace(tzinfo=timezone.utc)
             delta = datetime.now(timezone.utc) - last_coordinator_dt
             minutes = int(delta.total_seconds() / 60)
             if minutes < 1:

@@ -65,15 +65,15 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "start_coding_session",
-        "description": "Start a coding session. Choose agent tier based on task complexity: claude_code (senior/complex), opencode (mid/implementation), claude_local (junior/simple)",
+        "description": "Start a coding session. Choose agent tier based on task complexity: claude_code (senior/complex), opencode (mid/implementation), opencode_local (junior/simple)",
         "parameters": {
             "type": "object",
             "properties": {
                 "task_slug": {"type": "string", "description": "Task slug"},
                 "agent": {
                     "type": "string",
-                    "enum": ["claude_code", "claude_local", "opencode"],
-                    "description": "Agent tier: claude_code (senior), opencode (mid), claude_local (junior). Choose the lowest tier capable of the work.",
+                    "enum": ["claude_code", "opencode_local", "opencode"],
+                    "description": "Agent tier: claude_code (senior), opencode (mid), opencode_local (junior). Choose the lowest tier capable of the work.",
                 },
                 "prompt": {"type": "string", "description": "Initial prompt"},
             },
@@ -304,8 +304,8 @@ TOOL_DEFINITIONS = [
 ]
 
 # Agent tier ordering for escalation
-_AGENT_TIERS = {"claude_local": 0, "opencode": 1, "claude_code": 2}
-_TIER_ORDER = ["claude_local", "opencode", "claude_code"]
+_AGENT_TIERS = {"opencode_local": 0, "opencode": 1, "claude_code": 2}
+_TIER_ORDER = ["opencode_local", "opencode", "claude_code"]
 
 
 class CoordinatorService:
@@ -837,7 +837,7 @@ Agent Tiers (use these when starting coding sessions):
   tasks requiring deep reasoning or subtle judgment. Highest capability, highest cost.
 - opencode: Mid-level engineer (Kimi2.5). Use for well-scoped implementation tasks with clear
   requirements — adding endpoints, implementing features from specs, moderate refactors.
-- claude_local: Junior engineer (Qwen3). Use for simple, well-defined work — boilerplate,
+- opencode_local: Junior engineer (local llama.cpp). Use for simple, well-defined work — boilerplate,
   renaming, formatting, straightforward tests, small bug fixes with obvious solutions.
 
 When starting sessions, always choose the lowest tier capable of handling the work.
@@ -846,7 +846,7 @@ Keep decomposition responses short (under 500 words). If a task can't be quickly
 send it to claude_code.
 
 Review Policy:
-- After a claude_local (junior) session completes, review its work using review_session
+- After an opencode_local (junior) session completes, review its work using review_session
   to get a structured report. This runs tests and generates a summary automatically.
 - If the review shows status="failed" and the agent was junior/mid, the system will
   automatically escalate to a higher-tier agent. You'll see the escalation in the result.
@@ -1240,7 +1240,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             result["test_results"] = test_results.to_doc()
 
         # 7. Auto-escalation if failed and agent is junior/mid
-        if status == "failed" and session.agent_backend in ("claude_local", "opencode"):
+        if status == "failed" and session.agent_backend in ("opencode_local", "opencode"):
             escalation = await self._auto_escalate(session, summary)
             if escalation:
                 result["escalation"] = escalation

@@ -86,6 +86,16 @@ class AnthropicProvider:
             })
         return anthropic_tools
 
+    def _resolve_model(self, model: str) -> str:
+        """Use the given model if it looks like an Anthropic model, else default.
+
+        Anthropic models start with 'claude-'. Local model names like
+        'foo.gguf' or OpenRouter-style 'provider/model' aren't valid here.
+        """
+        if model and model.startswith("claude"):
+            return model
+        return self._default_model
+
     async def complete(
         self,
         messages: list[LLMMessage],
@@ -93,7 +103,7 @@ class AnthropicProvider:
     ) -> LLMResponse:
         """Generate a completion using the Anthropic API."""
         config = config or LLMConfig()
-        model = config.model or self._default_model
+        model = self._resolve_model(config.model)
         system_prompt, converted = self._convert_messages(messages)
         tools = self._convert_tools(config.tools)
 
@@ -145,7 +155,7 @@ class AnthropicProvider:
     ) -> AsyncIterator[str]:
         """Stream a completion from the Anthropic API."""
         config = config or LLMConfig()
-        model = config.model or self._default_model
+        model = self._resolve_model(config.model)
         system_prompt, converted = self._convert_messages(messages)
 
         kwargs: dict = {

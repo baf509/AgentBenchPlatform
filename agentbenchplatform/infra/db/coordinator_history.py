@@ -65,23 +65,31 @@ class CoordinatorHistoryRepo:
         return result.deleted_count > 0
 
     async def list_conversations(self) -> list[dict]:
-        """List all conversations with metadata."""
-        cursor = self._col.find(
-            {},
-            {"key": 1, "channel": 1, "sender_id": 1, "updated_at": 1, "messages": {"$slice": -1}},
-        ).sort("updated_at", -1)
+        """List all conversations with metadata.
+
+        Uses single aggregation to avoid N+1 queries.
+        """
+        pipeline = [
+            {"$sort": {"updated_at": -1}},
+            {
+                "$project": {
+                    "key": 1,
+                    "channel": 1,
+                    "sender_id": 1,
+                    "updated_at": 1,
+                    "message_count": {"$size": "$messages"},
+                }
+            },
+        ]
+
+        cursor = self._col.aggregate(pipeline)
         results = []
         async for doc in cursor:
-            msg_count_doc = await self._col.aggregate([
-                {"$match": {"_id": doc["_id"]}},
-                {"$project": {"count": {"$size": "$messages"}}},
-            ]).to_list(1)
-            count = msg_count_doc[0]["count"] if msg_count_doc else 0
             results.append({
                 "key": doc["key"],
                 "channel": doc.get("channel", ""),
                 "sender_id": doc.get("sender_id", ""),
                 "updated_at": doc.get("updated_at"),
-                "message_count": count,
+                "message_count": doc.get("message_count", 0),
             })
         return results

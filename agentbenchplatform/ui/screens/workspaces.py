@@ -8,6 +8,7 @@ from textual.app import ComposeResult
 from textual.widgets import Footer, Static, Tree
 
 from agentbenchplatform.ui.screens.base import BaseScreen
+from agentbenchplatform.ui.screens.confirm_dialog import ConfirmDialog
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,24 @@ class WorkspacesScreen(BaseScreen):
         self.app.push_screen(AddWorkspaceScreen(), callback=_on_dismiss)
 
     def action_delete_workspace(self) -> None:
-        self.run_worker(self._delete_workspace())
+        tree = self.query_one("#workspaces-tree", Tree)
+        node = tree.cursor_node
+        if node is None or not node.data or node.data.get("type") != "workspace":
+            self.app.notify("Select a workspace node to delete.", severity="warning")
+            return
+        if not node.data.get("standalone"):
+            self.app.notify(
+                "Only standalone workspaces can be deleted. "
+                "Task-derived workspaces are managed through tasks.",
+                severity="warning",
+            )
+            return
+        self.app.push_screen(
+            ConfirmDialog("Delete this workspace?"),
+            callback=lambda confirmed: (
+                self.run_worker(self._delete_workspace()) if confirmed else None
+            ),
+        )
 
     async def _delete_workspace(self) -> None:
         if not self.has_context():
@@ -118,23 +136,10 @@ class WorkspacesScreen(BaseScreen):
 
         tree = self.query_one("#workspaces-tree", Tree)
         node = tree.cursor_node
-        if node is None:
+        if node is None or not node.data:
             return
 
-        data = node.data
-        if not data or data.get("type") != "workspace":
-            self.app.notify("Select a workspace node to delete.", severity="warning")
-            return
-
-        if not data.get("standalone"):
-            self.app.notify(
-                "Only standalone workspaces can be deleted. "
-                "Task-derived workspaces are managed through tasks.",
-                severity="warning",
-            )
-            return
-
-        workspace_id = data.get("workspace_id")
+        workspace_id = node.data.get("workspace_id")
         if not workspace_id:
             return
 

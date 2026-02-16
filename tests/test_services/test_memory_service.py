@@ -48,7 +48,7 @@ class TestMemoryService:
             scope=MemoryScope.GLOBAL,
             id="mem1",
         )
-        entry = await service.store(key="test", content="hello")
+        await service.store(key="test", content="hello")
         mock_repo.insert.assert_called_once()
 
     @pytest.mark.asyncio
@@ -72,7 +72,7 @@ class TestMemoryService:
         mock_embedding.embed.return_value = None
         mock_repo.list_global.return_value = []
         query = MemoryQuery(query_text="test", scope=MemoryScope.GLOBAL)
-        results = await service.search(query)
+        await service.search(query)
         mock_repo.list_global.assert_called_once()
 
     @pytest.mark.asyncio

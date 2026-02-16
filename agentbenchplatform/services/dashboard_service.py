@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,26 +95,53 @@ class DashboardService:
         self._task_repo = task_repo
         self._session_repo = session_repo
         self._workspace_repo = workspace_repo
+        self._snapshot_cache: DashboardSnapshot | None = None
+        self._snapshot_cache_time: datetime | None = None
+        self._cache_ttl_seconds = 5
 
     async def load_snapshot(self) -> DashboardSnapshot:
-        """Build a complete system snapshot."""
+        """Build a complete system snapshot.
+
+        Uses a 5-second TTL cache to avoid rebuilding on every coordinator message.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Return cached snapshot if still fresh
+        if self._snapshot_cache and self._snapshot_cache_time:
+            age_seconds = (now - self._snapshot_cache_time).total_seconds()
+            if age_seconds < self._cache_ttl_seconds:
+                return self._snapshot_cache
+
+        # Rebuild snapshot
         tasks = await self._task_repo.list_tasks(include_archived=False)
+
+        # Parallelize session fetches to avoid N+1 queries
+        session_fetch_tasks = [
+            self._session_repo.list_by_task(task.id) for task in tasks
+        ]
+        all_sessions = await asyncio.gather(*session_fetch_tasks)
+
         total_running = 0
         total_sessions = 0
         task_snapshots = []
 
-        for task in tasks:
-            sessions = await self._session_repo.list_by_task(task.id)
+        for task, sessions in zip(tasks, all_sessions):
             ts = TaskSnapshot(task=task, sessions=sessions)
             task_snapshots.append(ts)
             total_running += ts.running_count
             total_sessions += ts.total_count
 
-        return DashboardSnapshot(
+        snapshot = DashboardSnapshot(
             tasks=task_snapshots,
             total_running=total_running,
             total_sessions=total_sessions,
         )
+
+        # Cache the snapshot
+        self._snapshot_cache = snapshot
+        self._snapshot_cache_time = now
+
+        return snapshot
 
     async def load_workspaces(self) -> list[WorkspaceSnapshot]:
         """Build workspace snapshots grouped by workspace_path.
@@ -129,12 +157,23 @@ class DashboardService:
             key = task.workspace_path or ""
             groups.setdefault(key, []).append(task)
 
+        # Parallelize session fetches to avoid N+1 queries
+        all_session_tasks = [
+            self._session_repo.list_by_task(task.id) for task in tasks
+        ]
+        all_sessions_list = await asyncio.gather(*all_session_tasks)
+
+        # Build a task_id -> sessions mapping
+        sessions_by_task_id = {
+            task.id: sessions for task, sessions in zip(tasks, all_sessions_list)
+        }
+
         workspaces = []
         seen_paths: set[str] = set()
         for path, group_tasks in sorted(groups.items()):
             task_snapshots = []
             for task in group_tasks:
-                sessions = await self._session_repo.list_by_task(task.id)
+                sessions = sessions_by_task_id.get(task.id, [])
                 task_snapshots.append(TaskSnapshot(task=task, sessions=sessions))
             workspaces.append(
                 WorkspaceSnapshot(workspace_path=path, tasks=task_snapshots)

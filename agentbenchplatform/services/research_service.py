@@ -225,7 +225,7 @@ class ResearchService:
                 timestamp=datetime.now(timezone.utc),
             ))
         except Exception:
-            logger.debug("Failed to log research usage", exc_info=True)
+            logger.warning("Failed to log research usage", exc_info=True)
 
     def _get_search_provider(self, provider_name: str):
         """Get a search provider instance."""
@@ -245,7 +245,7 @@ class ResearchService:
         session_id: str = "",
     ) -> list[str]:
         """Use LLM to generate sub-queries for research."""
-        learnings_text = "\n".join(f"- {l.content}" for l in learnings[-20:])
+        learnings_text = "\n".join(f"- {lr.content}" for lr in learnings[-20:])
         prompt = f"""Given the research query: "{query}"
 
 And these existing learnings:
@@ -349,7 +349,7 @@ Example: [{{"content": "fact here", "source_url": "https://..."}}]"""
         session_id: str = "",
     ) -> list[str]:
         """Generate follow-up queries based on learnings so far."""
-        learnings_text = "\n".join(f"- {l.content}" for l in learnings[-20:])
+        learnings_text = "\n".join(f"- {lr.content}" for lr in learnings[-20:])
 
         prompt = f"""Based on the original research query: "{original_query}"
 
@@ -394,8 +394,8 @@ Return as a JSON array of strings."""
         session_id: str = "",
     ) -> ResearchReport:
         """Compile all learnings into a final report."""
-        learnings_text = "\n".join(f"- {l.content} (source: {l.source_url})" for l in learnings)
-        sources = list({l.source_url for l in learnings if l.source_url})
+        learnings_text = "\n".join(f"- {lr.content} (source: {lr.source_url})" for lr in learnings)
+        sources = list({lr.source_url for lr in learnings if lr.source_url})
 
         prompt = f"""Write a comprehensive research report on: "{query}"
 

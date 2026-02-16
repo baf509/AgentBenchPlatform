@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agentbenchplatform.models.session import Session, SessionKind, SessionLifecycle
-from agentbenchplatform.models.task import Task, TaskStatus
+from agentbenchplatform.models.task import Task
 from agentbenchplatform.services.dashboard_service import DashboardService, DashboardSnapshot
 
 

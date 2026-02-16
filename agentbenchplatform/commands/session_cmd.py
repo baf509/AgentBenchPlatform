@@ -22,7 +22,7 @@ def session_group():
 
 @session_group.command("start")
 @click.argument("task_slug")
-@click.option("--agent", "-a", default="", help="Agent backend (claude_code, opencode)")
+@click.option("--agent", "-a", default="", help="Agent backend (claude_code, opencode, opencode_local)")
 @click.option("--prompt", "-p", default="", help="Initial prompt for the agent")
 @click.option("--model", "-m", default="", help="Model to use")
 def session_start(task_slug: str, agent: str, prompt: str, model: str):

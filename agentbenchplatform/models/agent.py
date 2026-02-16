@@ -10,7 +10,7 @@ from enum import Enum
 class AgentBackendType(str, Enum):
     CLAUDE_CODE = "claude_code"
     OPENCODE = "opencode"
-    CLAUDE_LOCAL = "claude_local"
+    OPENCODE_LOCAL = "opencode_local"
 
 
 @dataclass(frozen=True)

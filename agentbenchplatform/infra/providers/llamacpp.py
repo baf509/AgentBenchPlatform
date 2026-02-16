@@ -12,7 +12,7 @@ from agentbenchplatform.models.provider import LLMConfig, LLMMessage, LLMRespons
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "http://localhost:8080"
+DEFAULT_BASE_URL = "http://localhost:8012"
 
 
 class LlamaCppProvider:
@@ -129,6 +129,10 @@ class LlamaCppProvider:
         response.raise_for_status()
         data = response.json()
         return [item["embedding"] for item in data["data"]]
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
 
     async def health_check(self) -> bool:
         """Check if the llama.cpp server is reachable."""

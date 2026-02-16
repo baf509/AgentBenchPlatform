@@ -49,7 +49,13 @@ class FallbackProvider:
         messages: list[LLMMessage],
         config: LLMConfig | None = None,
     ) -> AsyncIterator[str]:
-        """Try each provider in order for streaming."""
+        """Try each provider in order for streaming.
+
+        Limitation: if a provider fails mid-stream (after yielding some chunks),
+        the already-yielded chunks cannot be retracted. The next provider will
+        restart from the beginning, so the caller may receive a partial response
+        from the failed provider followed by a full response from the fallback.
+        """
         last_error: Exception | None = None
 
         for provider, name in zip(self._providers, self._names):

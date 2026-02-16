@@ -27,6 +27,6 @@ async def get_remote_context():
         await ctx.initialize()
     except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
         raise SystemExit(
-            "Server not running. Start with: agentbenchplatform server start"
+            "Server not running. Start with: abp server start"
         ) from e
     return ctx
