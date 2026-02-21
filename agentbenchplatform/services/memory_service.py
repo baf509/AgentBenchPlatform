@@ -104,6 +104,24 @@ class MemoryService:
             return await self._repo.list_global()
         return await self._repo.list_by_task("", scope)
 
+    async def find_by_key(self, key: str, task_id: str = "") -> MemoryEntry | None:
+        """Find a memory entry by its key."""
+        return await self._repo.find_by_key(key, task_id)
+
+    async def list_by_session(self, session_id: str) -> list[MemoryEntry]:
+        """List memories scoped to a session."""
+        return await self._repo.list_by_session(session_id)
+
+    async def update_memory(
+        self, memory_id: str, content: str
+    ) -> MemoryEntry | None:
+        """Update memory content with auto re-embedding."""
+        embedding = await self._embedding.embed(content)
+        updated = await self._repo.update_content(memory_id, content, embedding)
+        if updated:
+            logger.debug("Updated memory %s with re-embedding", memory_id)
+        return updated
+
     async def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory entry."""
         return await self._repo.delete(memory_id)

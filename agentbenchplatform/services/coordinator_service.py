@@ -120,13 +120,16 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "store_memory",
-        "description": "Store a new shared memory entry",
+        "description": "Store a new shared memory entry with auto-embedding for vector search",
         "parameters": {
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "Memory key/identifier"},
                 "content": {"type": "string", "description": "Memory content"},
                 "task_slug": {"type": "string", "description": "Task to scope to (optional)"},
+                "session_id": {"type": "string", "description": "Session to scope to (optional)"},
+                "content_type": {"type": "string", "description": "Content type (text, code, json, etc.). Default: text"},
+                "metadata": {"type": "object", "description": "Arbitrary metadata dict (optional)"},
             },
             "required": ["key", "content"],
         },
@@ -418,6 +421,163 @@ TOOL_DEFINITIONS = [
                 "session_id": {"type": "string", "description": "Session ID whose branch to merge"},
             },
             "required": ["session_id"],
+        },
+    },
+    # --- Phase 3 tools ---
+    {
+        "name": "check_session_liveness",
+        "description": "Check if a session's process is still alive. Returns true/false.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "list_events_by_session",
+        "description": "List agent events for a specific session (stalls, errors, completions, help requests)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID to filter by"},
+                "limit": {"type": "integer", "description": "Max events (default 20)"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "list_reports_by_task",
+        "description": "List session reports for a task to see historical work quality",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+                "limit": {"type": "integer", "description": "Max reports (default 10)"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "list_recent_reports",
+        "description": "List most recent session reports across all tasks for a quick quality overview",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max reports (default 10)"},
+            },
+        },
+    },
+    {
+        "name": "get_memory_by_key",
+        "description": "Look up a memory entry by its exact key. Faster than vector search when you know the key.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Memory key"},
+                "task_slug": {"type": "string", "description": "Task slug to scope lookup (optional)"},
+            },
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "update_memory",
+        "description": "Update the content of an existing memory entry (auto re-embeds for vector search)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "Memory entry ID"},
+                "content": {"type": "string", "description": "New content"},
+            },
+            "required": ["memory_id", "content"],
+        },
+    },
+    {
+        "name": "list_memories_by_session",
+        "description": "List memories scoped to a specific session",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "get_usage_by_task",
+        "description": "Get token usage breakdown for a specific task",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "archive_session",
+        "description": "Archive a session (cleans up worktree, preserves data). Different from stop — use for completed sessions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "register_workspace",
+        "description": "Register a new workspace path in the system",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute filesystem path to the workspace"},
+                "name": {"type": "string", "description": "Human-friendly name (optional)"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "delete_workspace",
+        "description": "Remove a workspace registration (does NOT delete files, only the DB entry)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string", "description": "Workspace ID"},
+            },
+            "required": ["workspace_id"],
+        },
+    },
+    {
+        "name": "list_conversations",
+        "description": "List all coordinator conversation histories (channels and senders)",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "clear_conversation",
+        "description": "Clear conversation history for a channel/sender",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel name (e.g. 'tui', 'signal')"},
+                "sender_id": {"type": "string", "description": "Sender ID (optional, for Signal)"},
+            },
+            "required": ["channel"],
+        },
+    },
+    {
+        "name": "get_research_results",
+        "description": "Get research learnings stored as task memories from a research session",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+            },
+            "required": ["task_slug"],
         },
     },
 ]
@@ -1143,11 +1303,17 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     if task:
                         task_id = task.id
                         scope = MemoryScope.TASK
+                session_id = arguments.get("session_id", "")
+                if session_id:
+                    scope = MemoryScope.SESSION
                 entry = await self._memory.store(
                     key=arguments["key"],
                     content=arguments["content"],
                     scope=scope,
                     task_id=task_id,
+                    session_id=session_id,
+                    content_type=arguments.get("content_type", "text"),
+                    metadata=arguments.get("metadata"),
                 )
                 return {"stored": True, "id": entry.id}
 
@@ -1411,6 +1577,187 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     return {"error": "Could not determine session branch name"}
                 result = await git_ops.merge_branch(task.workspace_path, branch_name)
                 return {"merged": True, "branch": branch_name, "output": result}
+
+            # --- Phase 3 tool handlers ---
+
+            elif name == "check_session_liveness":
+                alive = await self._session.check_session_liveness(
+                    arguments["session_id"]
+                )
+                return {"alive": alive, "session_id": arguments["session_id"]}
+
+            elif name == "list_events_by_session":
+                if not self._agent_event_repo:
+                    return {"error": "Agent event repo not available"}
+                events = await self._agent_event_repo.list_by_session(
+                    session_id=arguments["session_id"],
+                    limit=arguments.get("limit", 20),
+                )
+                return [
+                    {
+                        "id": e.id,
+                        "session_id": e.session_id,
+                        "event_type": e.event_type.value,
+                        "detail": e.detail,
+                        "acknowledged": e.acknowledged,
+                        "created_at": e.created_at.isoformat(),
+                    }
+                    for e in events
+                ]
+
+            elif name == "list_reports_by_task":
+                if not self._session_report_repo:
+                    return {"error": "Session report repo not available"}
+                task = await self._task.get_task(arguments["task_slug"])
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                reports = await self._session_report_repo.list_by_task(
+                    task_id=task.id,
+                    limit=arguments.get("limit", 10),
+                )
+                return [
+                    {
+                        "session_id": r.session_id,
+                        "agent": r.agent,
+                        "status": r.status,
+                        "summary": r.summary[:200],
+                        "files_changed": list(r.files_changed),
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in reports
+                ]
+
+            elif name == "list_recent_reports":
+                if not self._session_report_repo:
+                    return {"error": "Session report repo not available"}
+                reports = await self._session_report_repo.list_recent(
+                    limit=arguments.get("limit", 10),
+                )
+                return [
+                    {
+                        "session_id": r.session_id,
+                        "task_id": r.task_id,
+                        "agent": r.agent,
+                        "status": r.status,
+                        "summary": r.summary[:200],
+                        "created_at": r.created_at.isoformat(),
+                    }
+                    for r in reports
+                ]
+
+            elif name == "get_memory_by_key":
+                task_id = ""
+                if task_slug := arguments.get("task_slug"):
+                    task = await self._task.get_task(task_slug)
+                    task_id = task.id if task else ""
+                entry = await self._memory.find_by_key(
+                    arguments["key"], task_id=task_id,
+                )
+                if not entry:
+                    return {"error": f"No memory found with key: {arguments['key']}"}
+                return {
+                    "id": entry.id,
+                    "key": entry.key,
+                    "content": entry.content,
+                    "scope": entry.scope.value,
+                    "task_id": entry.task_id,
+                    "session_id": entry.session_id,
+                    "content_type": entry.content_type,
+                    "created_at": entry.created_at.isoformat(),
+                }
+
+            elif name == "update_memory":
+                updated = await self._memory.update_memory(
+                    arguments["memory_id"], arguments["content"],
+                )
+                if not updated:
+                    return {"error": f"Memory not found: {arguments['memory_id']}"}
+                return {"updated": True, "id": updated.id}
+
+            elif name == "list_memories_by_session":
+                memories = await self._memory.list_by_session(
+                    arguments["session_id"],
+                )
+                return [
+                    {
+                        "id": m.id,
+                        "key": m.key,
+                        "content": m.content[:500],
+                        "scope": m.scope.value,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in memories
+                ]
+
+            elif name == "get_usage_by_task":
+                if not self._usage_repo:
+                    return {"error": "Usage tracking not available"}
+                task = await self._task.get_task(arguments["task_slug"])
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                result = await self._usage_repo.aggregate_by_task(task.id)
+                return result
+
+            elif name == "archive_session":
+                session = await self._session.archive_session(
+                    arguments["session_id"]
+                )
+                if not session:
+                    return {"error": "Session not found"}
+                return {"archived": True, "session_id": session.id}
+
+            elif name == "register_workspace":
+                if not self._workspace_repo:
+                    return {"error": "Workspace repo not available"}
+                from agentbenchplatform.models.workspace import Workspace
+                ws = await self._workspace_repo.insert(Workspace(
+                    path=arguments["path"],
+                    name=arguments.get("name", ""),
+                ))
+                return {"registered": True, "id": ws.id, "path": ws.path}
+
+            elif name == "delete_workspace":
+                if not self._workspace_repo:
+                    return {"error": "Workspace repo not available"}
+                deleted = await self._workspace_repo.delete(arguments["workspace_id"])
+                return {"deleted": deleted}
+
+            elif name == "list_conversations":
+                if not self._history_repo:
+                    return {"error": "History repo not available"}
+                convos = await self._history_repo.list_conversations()
+                for c in convos:
+                    if "updated_at" in c and c["updated_at"] is not None:
+                        c["updated_at"] = c["updated_at"].isoformat()
+                return convos
+
+            elif name == "clear_conversation":
+                if not self._history_repo:
+                    return {"error": "History repo not available"}
+                cleared = await self._history_repo.clear_conversation(
+                    arguments["channel"],
+                    arguments.get("sender_id", ""),
+                )
+                # Also clear in-memory cache
+                key = f"{arguments['channel']}:{arguments.get('sender_id', '')}"
+                self._conversations.pop(key, None)
+                return {"cleared": cleared}
+
+            elif name == "get_research_results":
+                if not self._research:
+                    return {"error": "Research service not available"}
+                task = await self._task.get_task(arguments["task_slug"])
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                results = await self._research.get_research_results(task.id)
+                return [
+                    {
+                        "key": m.key,
+                        "content": m.content[:500],
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in results
+                ]
 
             else:
                 return {"error": f"Unknown tool: {name}"}
