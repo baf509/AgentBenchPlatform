@@ -75,6 +75,39 @@ async def get_log(worktree_path: str, max_commits: int = 10) -> str:
     return stdout.decode(errors="replace").strip()
 
 
+async def merge_branch(workspace_path: str, branch_name: str) -> str:
+    """Merge a branch into the current branch at workspace_path.
+
+    Runs ``git merge <branch_name> --no-edit``.  On conflict the merge is
+    automatically aborted so the workspace stays clean.  Returns the merge
+    output on success or an error description on failure.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git", "merge", branch_name, "--no-edit",
+        cwd=workspace_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        # Auto-abort to leave workspace clean
+        abort = await asyncio.create_subprocess_exec(
+            "git", "merge", "--abort",
+            cwd=workspace_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await abort.communicate()
+        error_msg = stderr.decode(errors="replace").strip()
+        logger.warning("git merge %s failed in %s: %s", branch_name, workspace_path, error_msg)
+        raise RuntimeError(f"Merge failed (auto-aborted): {error_msg}")
+
+    result = stdout.decode(errors="replace").strip()
+    logger.info("Merged branch %s into %s", branch_name, workspace_path)
+    return result
+
+
 async def remove_worktree(workspace_path: str, worktree_path: str) -> bool:
     """Remove a git worktree. Returns True on success."""
     if not worktree_path:

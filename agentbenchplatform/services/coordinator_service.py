@@ -12,12 +12,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agentbenchplatform.config import AppConfig
+from agentbenchplatform.infra import git as git_ops
 from agentbenchplatform.infra.db.agent_events import AgentEventRepo
 from agentbenchplatform.infra.db.conversation_summaries import ConversationSummaryRepo
 from agentbenchplatform.infra.db.coordinator_decisions import CoordinatorDecisionRepo
 from agentbenchplatform.infra.db.coordinator_history import CoordinatorHistoryRepo
 from agentbenchplatform.infra.db.session_reports import SessionReportRepo
 from agentbenchplatform.infra.db.usage import UsageRepo
+from agentbenchplatform.infra.db.workspaces import WorkspaceRepo
 from agentbenchplatform.infra.providers.registry import get_provider_with_fallback
 from agentbenchplatform.models.agent_event import AgentEvent, AgentEventType
 from agentbenchplatform.models.conversation_summary import ConversationSummary
@@ -131,12 +133,15 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "create_task",
-        "description": "Create a new task",
+        "description": "Create a new task. Set workspace_path to enable coding sessions.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string", "description": "Task title"},
                 "description": {"type": "string", "description": "Task description"},
+                "workspace_path": {"type": "string", "description": "Absolute path to the project workspace (required for coding sessions)"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for categorization"},
+                "complexity": {"type": "string", "enum": ["junior", "mid", "senior", ""], "description": "Task complexity tier"},
             },
             "required": ["title"],
         },
@@ -301,6 +306,120 @@ TOOL_DEFINITIONS = [
             "required": ["session_id", "minutes"],
         },
     },
+    # --- Phase 2 tools ---
+    {
+        "name": "get_task_detail",
+        "description": "Get full task details including description, workspace_path, tags, complexity, and timestamps",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "update_task",
+        "description": "Update task fields: description, workspace_path, tags, complexity",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+                "description": {"type": "string", "description": "New description"},
+                "workspace_path": {"type": "string", "description": "New workspace path"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags"},
+                "complexity": {"type": "string", "enum": ["junior", "mid", "senior", ""], "description": "New complexity"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "archive_task",
+        "description": "Archive a task (hides from default listing but preserves data)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug to archive"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "list_memories",
+        "description": "Browse stored memories with optional filters",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Filter by task slug (optional)"},
+                "scope": {"type": "string", "enum": ["global", "task", "session"], "description": "Filter by scope (optional)"},
+                "limit": {"type": "integer", "description": "Max results (default 20)"},
+            },
+        },
+    },
+    {
+        "name": "delete_memory",
+        "description": "Delete a memory entry by ID",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "Memory entry ID"},
+            },
+            "required": ["memory_id"],
+        },
+    },
+    {
+        "name": "get_usage_summary",
+        "description": "Get token usage summary: recent window + all-time totals",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "hours": {"type": "integer", "description": "Hours for recent window (default 6)"},
+            },
+        },
+    },
+    {
+        "name": "get_session_git_log",
+        "description": "Get git log from a session's worktree to see commit history",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID"},
+                "max_commits": {"type": "integer", "description": "Max commits to show (default 10)"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    {
+        "name": "list_workspaces",
+        "description": "List all registered workspaces",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "send_notification",
+        "description": "Send a Signal message notification to a phone number",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "recipient": {"type": "string", "description": "Phone number (e.g. +1234567890)"},
+                "text": {"type": "string", "description": "Message text"},
+            },
+            "required": ["recipient", "text"],
+        },
+    },
+    {
+        "name": "merge_session",
+        "description": "Merge a session's worktree branch into the main workspace. Use after reviewing and approving session work.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID whose branch to merge"},
+            },
+            "required": ["session_id"],
+        },
+    },
 ]
 
 # Agent tier ordering for escalation
@@ -329,6 +448,7 @@ class CoordinatorService:
         coordinator_decision_repo: CoordinatorDecisionRepo | None = None,
         conversation_summary_repo: ConversationSummaryRepo | None = None,
         agent_event_repo: AgentEventRepo | None = None,
+        workspace_repo: WorkspaceRepo | None = None,
     ) -> None:
         self._dashboard = dashboard_service
         self._session = session_service
@@ -342,6 +462,8 @@ class CoordinatorService:
         self._coordinator_decision_repo = coordinator_decision_repo
         self._conversation_summary_repo = conversation_summary_repo
         self._agent_event_repo = agent_event_repo
+        self._workspace_repo = workspace_repo
+        self._signal = None  # set via set_signal_service()
         self._provider = get_provider_with_fallback(config, config.coordinator.provider)
         self._llm_config = LLMConfig(
             model=config.coordinator.model,
@@ -351,7 +473,14 @@ class CoordinatorService:
         )
         self._conversations: dict[str, list[LLMMessage]] = {}
         self._watchdog_task: asyncio.Task | None = None
+        self._patrol_task: asyncio.Task | None = None
         self._session_deadlines: dict[str, float] = {}  # session_id -> deadline timestamp
+
+    # --- Late Binding ---
+
+    def set_signal_service(self, signal_service) -> None:
+        """Late-bind the signal service (avoids circular dependency)."""
+        self._signal = signal_service
 
     # --- Watchdog ---
 
@@ -366,13 +495,25 @@ class CoordinatorService:
         )
         logger.info("Coordinator watchdog started (interval=%ds, stall=%ds)",
                      check_interval, stall_threshold)
+        # Start patrol if configured
+        if self._config.coordinator.patrol_enabled and self._patrol_task is None:
+            self._patrol_task = asyncio.ensure_future(self._patrol_loop())
+            logger.info(
+                "Coordinator patrol started (interval=%ds, autonomy=%s)",
+                self._config.coordinator.patrol_interval,
+                self._config.coordinator.patrol_autonomy,
+            )
 
     def stop_watchdog(self) -> None:
-        """Stop the background watchdog task."""
+        """Stop the background watchdog and patrol tasks."""
         if self._watchdog_task is not None:
             self._watchdog_task.cancel()
             self._watchdog_task = None
             logger.info("Coordinator watchdog stopped")
+        if self._patrol_task is not None:
+            self._patrol_task.cancel()
+            self._patrol_task = None
+            logger.info("Coordinator patrol stopped")
 
     async def _watchdog_loop(
         self, check_interval: int, stall_threshold: int
@@ -824,13 +965,16 @@ class CoordinatorService:
         return f"""You are the agentbench coordinator - a meta-agent with full visibility and control over all tasks, sessions, and agents in the system.
 
 You can:
-- Monitor: See all tasks, sessions, their statuses, recent outputs, and errors
-- Manage: Start/stop/pause/resume sessions, create tasks, assign work, set deadlines
-- Advise: Answer questions about what agents are doing, summarize progress
+- Monitor: See all tasks, sessions, their statuses, recent outputs, git logs, and errors
+- Manage: Start/stop/pause/resume sessions, create/update/archive tasks, set deadlines
+- Advise: Answer questions about what agents are doing, summarize progress, show usage
 - Delegate: Route user requests to the appropriate agent or action
-- Remember: Access the full memory system (global + per-task)
+- Remember: Access the full memory system — search, list, store, and delete memories
 - Review: Generate structured session reports with diff stats, test results, and summaries
 - React: Check and acknowledge agent events (stalls, errors, help requests)
+- Decompose: Break high-level goals into subtasks, create them, assign agents, monitor
+- Merge: Merge completed session work back into the main workspace
+- Notify: Send Signal messages to alert the user about important events
 
 Agent Tiers (use these when starting coding sessions):
 - claude_code: Senior engineer. Use for architecture, complex refactors, multi-file changes,
@@ -844,6 +988,10 @@ When starting sessions, always choose the lowest tier capable of handling the wo
 When decomposing tasks, classify briefly and assign — do not design the solution yourself.
 Keep decomposition responses short (under 500 words). If a task can't be quickly classified,
 send it to claude_code.
+
+Goal Decomposition:
+When given a high-level goal, break it into concrete subtasks with create_task (set workspace_path!),
+then start sessions for each. Monitor progress, review completed work, merge successful branches.
 
 Review Policy:
 - After an opencode_local (junior) session completes, review its work using review_session
@@ -897,7 +1045,15 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     show_all=arguments.get("show_all", False)
                 )
                 return [
-                    {"slug": t.slug, "title": t.title, "status": t.status.value}
+                    {
+                        "slug": t.slug,
+                        "title": t.title,
+                        "status": t.status.value,
+                        "description": t.description[:100] if t.description else "",
+                        "workspace_path": t.workspace_path,
+                        "tags": list(t.tags),
+                        "complexity": t.complexity,
+                    }
                     for t in tasks
                 ]
 
@@ -915,6 +1071,10 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                         "kind": s.kind.value,
                         "lifecycle": s.lifecycle.value,
                         "task_id": s.task_id,
+                        "agent_backend": s.agent_backend,
+                        "worktree_path": s.worktree_path,
+                        "created_at": s.created_at.isoformat(),
+                        "updated_at": s.updated_at.isoformat(),
                     }
                     for s in sessions
                 ]
@@ -971,7 +1131,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 )
                 results = await self._memory.search(query)
                 return [
-                    {"key": m.key, "content": m.content[:200], "scope": m.scope.value}
+                    {"key": m.key, "content": m.content[:500], "scope": m.scope.value, "id": m.id}
                     for m in results
                 ]
 
@@ -995,6 +1155,9 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 task = await self._task.create_task(
                     title=arguments["title"],
                     description=arguments.get("description", ""),
+                    workspace_path=arguments.get("workspace_path", ""),
+                    tags=tuple(arguments.get("tags", [])),
+                    complexity=arguments.get("complexity", ""),
                 )
                 return {"slug": task.slug, "id": task.id}
 
@@ -1124,6 +1287,130 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 minutes = arguments["minutes"]
                 self._session_deadlines[sid] = time.time() + (minutes * 60)
                 return {"deadline_set": True, "session_id": sid, "minutes": minutes}
+
+            # --- Phase 2 tool handlers ---
+
+            elif name == "get_task_detail":
+                task = await self._task.get_task(arguments["task_slug"])
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                return {
+                    "slug": task.slug,
+                    "title": task.title,
+                    "status": task.status.value,
+                    "description": task.description,
+                    "workspace_path": task.workspace_path,
+                    "tags": list(task.tags),
+                    "complexity": task.complexity,
+                    "created_at": task.created_at.isoformat(),
+                    "updated_at": task.updated_at.isoformat(),
+                    "id": task.id,
+                }
+
+            elif name == "update_task":
+                task = await self._task.update_task(
+                    slug=arguments["task_slug"],
+                    description=arguments.get("description"),
+                    workspace_path=arguments.get("workspace_path"),
+                    tags=tuple(arguments["tags"]) if "tags" in arguments else None,
+                    complexity=arguments.get("complexity"),
+                )
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                return {"updated": True, "slug": task.slug}
+
+            elif name == "archive_task":
+                task = await self._task.archive_task(arguments["task_slug"])
+                if not task:
+                    return {"error": f"Task not found: {arguments['task_slug']}"}
+                return {"archived": True, "slug": task.slug}
+
+            elif name == "list_memories":
+                task_id = ""
+                if task_slug := arguments.get("task_slug"):
+                    task = await self._task.get_task(task_slug)
+                    task_id = task.id if task else ""
+                scope = MemoryScope(arguments["scope"]) if arguments.get("scope") else None
+                memories = await self._memory.list_memories(
+                    task_id=task_id, scope=scope,
+                )
+                limit = arguments.get("limit", 20)
+                return [
+                    {
+                        "id": m.id,
+                        "key": m.key,
+                        "content": m.content[:500],
+                        "scope": m.scope.value,
+                        "task_id": m.task_id,
+                        "created_at": m.created_at.isoformat(),
+                    }
+                    for m in memories[:limit]
+                ]
+
+            elif name == "delete_memory":
+                deleted = await self._memory.delete_memory(arguments["memory_id"])
+                return {"deleted": deleted}
+
+            elif name == "get_usage_summary":
+                if not self._usage_repo:
+                    return {"error": "Usage tracking not available"}
+                hours = arguments.get("hours", 6)
+                recent = await self._usage_repo.aggregate_recent(hours=hours)
+                totals = await self._usage_repo.aggregate_totals()
+                return {"recent": recent, "totals": totals, "recent_hours": hours}
+
+            elif name == "get_session_git_log":
+                session = await self._session.get_session(arguments["session_id"])
+                if not session:
+                    return {"error": "Session not found"}
+                if not session.worktree_path:
+                    return {"error": "Session has no worktree"}
+                log = await git_ops.get_log(
+                    session.worktree_path,
+                    max_commits=arguments.get("max_commits", 10),
+                )
+                return {"log": log}
+
+            elif name == "list_workspaces":
+                if not self._workspace_repo:
+                    return {"error": "Workspace repo not available"}
+                workspaces = await self._workspace_repo.list_all()
+                return [
+                    {"id": ws.id, "path": ws.path, "name": ws.name}
+                    for ws in workspaces
+                ]
+
+            elif name == "send_notification":
+                if not self._signal:
+                    return {"error": "Signal service not available"}
+                sent = await self._signal.send_notification(
+                    arguments["recipient"], arguments["text"],
+                )
+                return {"sent": sent}
+
+            elif name == "merge_session":
+                session = await self._session.get_session(arguments["session_id"])
+                if not session:
+                    return {"error": "Session not found"}
+                if not session.worktree_path:
+                    return {"error": "Session has no worktree"}
+                # Find the task to get the main workspace path
+                task = await self._task.get_task_by_id(session.task_id)
+                if not task or not task.workspace_path:
+                    return {"error": "Task has no workspace_path — cannot determine merge target"}
+                # Get the branch name from the worktree
+                branch_proc = await asyncio.create_subprocess_exec(
+                    "git", "rev-parse", "--abbrev-ref", "HEAD",
+                    cwd=session.worktree_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await branch_proc.communicate()
+                branch_name = stdout.decode().strip()
+                if not branch_name:
+                    return {"error": "Could not determine session branch name"}
+                result = await git_ops.merge_branch(task.workspace_path, branch_name)
+                return {"merged": True, "branch": branch_name, "output": result}
 
             else:
                 return {"error": f"Unknown tool: {name}"}
@@ -1456,6 +1743,139 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             errors=errors,
             output_snippet=output[-500:] if len(output) > 500 else output,
         )
+
+    # --- Patrol Mode ---
+
+    async def _patrol_loop(self) -> None:
+        """Background loop that periodically surveys system state."""
+        interval = self._config.coordinator.patrol_interval
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._run_patrol()
+                except Exception:
+                    logger.warning("Patrol check failed", exc_info=True)
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_patrol(self) -> None:
+        """Single patrol iteration: gather state, optionally act."""
+        autonomy = self._config.coordinator.patrol_autonomy
+
+        # Gather system snapshot
+        snapshot = await self._dashboard.load_snapshot()
+        state_text = snapshot.summary_text()
+
+        # Gather unacked events
+        unacked_events: list[AgentEvent] = []
+        if self._agent_event_repo:
+            try:
+                unacked_events = await self._agent_event_repo.list_unacknowledged(limit=20)
+            except Exception:
+                pass
+
+        # Gather running session outputs (brief)
+        session_summaries: list[str] = []
+        sessions = await self._session.list_sessions()
+        for s in sessions:
+            if s.lifecycle == SessionLifecycle.RUNNING:
+                try:
+                    output = await self._session.get_session_output(s.id, lines=5)
+                    last_line = (output or "").strip().splitlines()[-1] if output else "(no output)"
+                    session_summaries.append(f"  {s.id[:8]}... ({s.agent_backend}): {last_line[:100]}")
+                except Exception:
+                    session_summaries.append(f"  {s.id[:8]}... ({s.agent_backend}): (could not read output)")
+
+        if autonomy == "observe":
+            # Log-only mode — no LLM calls, zero cost
+            logger.info(
+                "Patrol [observe]: %d running sessions, %d unacked events",
+                len(session_summaries), len(unacked_events),
+            )
+            return
+
+        # Build patrol prompt for the LLM
+        event_text = ""
+        if unacked_events:
+            event_lines = [
+                f"  [{e.event_type.value}] session={e.session_id[:8]}... {e.detail[:100]}"
+                for e in unacked_events
+            ]
+            event_text = "\nUnacknowledged Events:\n" + "\n".join(event_lines)
+
+        session_text = ""
+        if session_summaries:
+            session_text = "\nRunning Sessions (last output):\n" + "\n".join(session_summaries)
+
+        # Restrict available tools based on autonomy level
+        if autonomy == "nudge":
+            allowed_tools = {"send_to_session", "acknowledge_events", "list_agent_events",
+                             "get_session_output", "list_tasks", "list_sessions"}
+        else:  # full
+            allowed_tools = {t["name"] for t in TOOL_DEFINITIONS}
+
+        patrol_prompt = f"""You are running in autonomous patrol mode (autonomy={autonomy}).
+Survey the system and take appropriate action if needed.
+
+System State:
+{state_text}{event_text}{session_text}
+
+Rules:
+- Only act if something clearly needs attention (stalls, errors, help requests)
+- In nudge mode: you can only send messages to sessions and acknowledge events
+- In full mode: you can start/stop sessions, send notifications, and escalate
+- Be conservative — prefer observing over acting
+- Keep responses very brief (under 100 words)"""
+
+        patrol_config = LLMConfig(
+            model=self._llm_config.model,
+            max_tokens=1024,
+            temperature=0.3,
+            tools=[t for t in TOOL_DEFINITIONS if t["name"] in allowed_tools],
+        )
+
+        messages = [
+            LLMMessage(role="system", content=patrol_prompt),
+            LLMMessage(role="user", content="Run patrol check now."),
+        ]
+
+        # Allow up to 3 tool rounds in patrol
+        for _ in range(3):
+            try:
+                response = await self._provider.complete(messages, patrol_config)
+            except Exception:
+                logger.warning("Patrol LLM call failed", exc_info=True)
+                return
+
+            if not response.has_tool_calls:
+                if response.content:
+                    logger.info("Patrol [%s]: %s", autonomy, response.content[:200])
+                return
+
+            # Execute tool calls
+            assistant_msg = LLMMessage(
+                role="assistant",
+                content=response.content,
+                tool_calls=[
+                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                    for tc in response.tool_calls
+                ],
+            )
+            messages.append(assistant_msg)
+
+            for tc in response.tool_calls:
+                if tc.name not in allowed_tools:
+                    result = {"error": f"Tool {tc.name} not allowed in {autonomy} mode"}
+                else:
+                    result = await self._execute_tool_with_retry(tc.name, tc.arguments)
+                logger.info("Patrol executed tool %s -> %s", tc.name, json.dumps(result, default=str)[:200])
+                messages.append(LLMMessage(
+                    role="tool",
+                    content=json.dumps(result, default=str),
+                    tool_call_id=tc.id,
+                    name=tc.name,
+                ))
 
     # --- One-Shot Ask ---
 

@@ -261,7 +261,11 @@ class AppContext:
                 coordinator_decision_repo=self.coordinator_decision_repo,
                 conversation_summary_repo=self.conversation_summary_repo,
                 agent_event_repo=self.agent_event_repo,
+                workspace_repo=self.workspace_repo,
             )
+            # If signal service already exists, wire it in
+            if self._signal_service is not None:
+                self._coordinator_service.set_signal_service(self._signal_service)
         return self._coordinator_service
 
     @property
@@ -273,4 +277,6 @@ class AppContext:
                 coordinator=self.coordinator_service,
                 config=self.config.signal,
             )
+            # Late-bind signal service into coordinator
+            self._coordinator_service.set_signal_service(self._signal_service)
         return self._signal_service

@@ -66,6 +66,31 @@ class TaskService:
             logger.info("Archived task: %s", slug)
         return task
 
+    async def update_task(
+        self,
+        slug: str,
+        description: str | None = None,
+        workspace_path: str | None = None,
+        tags: tuple[str, ...] | None = None,
+        complexity: str | None = None,
+    ) -> Task | None:
+        """Update task fields. Only non-None values are applied."""
+        updates: dict = {}
+        if description is not None:
+            updates["description"] = description
+        if workspace_path is not None:
+            updates["workspace_path"] = workspace_path
+        if tags is not None:
+            updates["tags"] = list(tags)
+        if complexity is not None:
+            updates["complexity"] = complexity
+        if not updates:
+            return await self._repo.find_by_slug(slug)
+        task = await self._repo.update(slug, updates)
+        if task:
+            logger.info("Updated task: %s (fields: %s)", slug, list(updates.keys()))
+        return task
+
     async def delete_task(self, slug: str) -> Task | None:
         """Soft-delete a task."""
         task = await self._repo.update_status(slug, TaskStatus.DELETED)

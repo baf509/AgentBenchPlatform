@@ -44,6 +44,7 @@ class MethodRegistry:
         self._methods["task.get"] = self._task_get
         self._methods["task.get_by_id"] = self._task_get_by_id
         self._methods["task.create"] = self._task_create
+        self._methods["task.update"] = self._task_update
         self._methods["task.archive"] = self._task_archive
         self._methods["task.delete"] = self._task_delete
 
@@ -184,6 +185,19 @@ class MethodRegistry:
             complexity=params.get("complexity", ""),
         )
         return serialize_task(task)
+
+    async def _task_update(self, params: dict) -> dict | None:
+        self._validate_str(params, "slug")
+        if "tags" in params:
+            self._validate_tags(params)
+        task = await self._ctx.task_service.update_task(
+            slug=params["slug"],
+            description=params.get("description"),
+            workspace_path=params.get("workspace_path"),
+            tags=tuple(params["tags"]) if "tags" in params else None,
+            complexity=params.get("complexity"),
+        )
+        return serialize_task(task) if task else None
 
     async def _task_archive(self, params: dict) -> dict | None:
         task = await self._ctx.task_service.archive_task(params["slug"])

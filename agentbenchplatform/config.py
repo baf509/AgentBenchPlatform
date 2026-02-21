@@ -38,7 +38,7 @@ workspace_root = "~/agentbench-workspaces"
 default_agent = "claude_code"
 
 [mongodb]
-uri = "mongodb://localhost:27017/?directConnection=true"
+uri = "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
 database = "agentbenchplatform"
 
 [providers.anthropic]
@@ -50,13 +50,13 @@ api_key_env = "OPENROUTER_API_KEY"
 default_model = "anthropic/claude-sonnet-4"
 
 [providers.llamacpp]
-base_url = "http://localhost:8012"
-opencode_model = "llama.cpp/step3p5-flash"
+base_url = "http://localhost:8080"
+opencode_model = "llamacpp/step3p5_flash_Q4_K_S-00001-of-00012.gguf"
 
 [embeddings]
-provider = "llamacpp"
-base_url = "http://localhost:8012"
-dimensions = 768
+provider = "voyage-4-nano"
+base_url = "http://localhost:8001"
+dimensions = 1024
 
 [coordinator]
 provider = "anthropic"
@@ -90,7 +90,7 @@ session_prefix = "ab"
 
 @dataclass
 class MongoConfig:
-    uri: str = "mongodb://localhost:27017"
+    uri: str = "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
     database: str = "agentbenchplatform"
 
 
@@ -105,15 +105,19 @@ class ProviderConfig:
 
 @dataclass
 class EmbeddingsConfig:
-    provider: str = "llamacpp"
-    base_url: str = "http://localhost:8012"
-    dimensions: int = 768
+    provider: str = "voyage-4-nano"
+    base_url: str = "http://localhost:8001"
+    dimensions: int = 1024
 
 
 @dataclass
 class CoordinatorConfig:
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-20250514"
+    patrol_enabled: bool = False
+    patrol_interval: int = 300
+    patrol_autonomy: str = "observe"  # observe, nudge, full
+    patrol_notify_phone: str = ""
 
 
 @dataclass
@@ -226,18 +230,22 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         workspace_root=general.get("workspace_root", "~/agentbench-workspaces"),
         default_agent=general.get("default_agent", "claude_code"),
         mongodb=MongoConfig(
-            uri=mongo_raw.get("uri", "mongodb://localhost:27017"),
+            uri=mongo_raw.get("uri", "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"),
             database=mongo_raw.get("database", "agentbenchplatform"),
         ),
         providers={name: _parse_provider(data) for name, data in providers_raw.items()},
         embeddings=EmbeddingsConfig(
-            provider=embeddings_raw.get("provider", "llamacpp"),
-            base_url=embeddings_raw.get("base_url", "http://localhost:8012"),
-            dimensions=embeddings_raw.get("dimensions", 768),
+            provider=embeddings_raw.get("provider", "voyage-4-nano"),
+            base_url=embeddings_raw.get("base_url", "http://localhost:8001"),
+            dimensions=embeddings_raw.get("dimensions", 1024),
         ),
         coordinator=CoordinatorConfig(
             provider=coordinator_raw.get("provider", "anthropic"),
             model=coordinator_raw.get("model", "claude-sonnet-4-20250514"),
+            patrol_enabled=coordinator_raw.get("patrol_enabled", False),
+            patrol_interval=coordinator_raw.get("patrol_interval", 300),
+            patrol_autonomy=coordinator_raw.get("patrol_autonomy", "observe"),
+            patrol_notify_phone=coordinator_raw.get("patrol_notify_phone", ""),
         ),
         research=ResearchDefaults(
             default_provider=research_raw.get("default_provider", "anthropic"),
