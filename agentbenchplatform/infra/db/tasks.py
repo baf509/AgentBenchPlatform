@@ -35,6 +35,7 @@ class TaskRepo:
             workspace_path=task.workspace_path,
             tags=task.tags,
             complexity=task.complexity,
+            depends_on=task.depends_on,
             created_at=task.created_at,
             updated_at=task.updated_at,
         )
@@ -91,3 +92,41 @@ class TaskRepo:
         """Permanently delete a task by slug."""
         result = await self._col.delete_one({"slug": slug})
         return result.deleted_count > 0
+
+    async def find_dependents(self, slug: str) -> list[Task]:
+        """Find tasks that depend on the given task slug."""
+        cursor = self._col.find({"depends_on": slug})
+        return [Task.from_doc(doc) async for doc in cursor]
+
+    async def find_ready_tasks(self) -> list[Task]:
+        """Find active tasks whose dependencies are all satisfied (archived)."""
+        # Get all active tasks that have dependencies
+        cursor = self._col.find({
+            "status": TaskStatus.ACTIVE.value,
+            "depends_on": {"$exists": True, "$ne": []},
+        })
+        candidates = [Task.from_doc(doc) async for doc in cursor]
+
+        # Also get active tasks with no dependencies
+        cursor2 = self._col.find({
+            "status": TaskStatus.ACTIVE.value,
+            "$or": [
+                {"depends_on": {"$exists": False}},
+                {"depends_on": []},
+            ],
+        })
+        no_deps = [Task.from_doc(doc) async for doc in cursor2]
+
+        # Check each candidate's deps are all archived
+        ready = list(no_deps)
+        for task in candidates:
+            all_satisfied = True
+            for dep_slug in task.depends_on:
+                dep = await self.find_by_slug(dep_slug)
+                if not dep or dep.status != TaskStatus.ARCHIVED:
+                    all_satisfied = False
+                    break
+            if all_satisfied:
+                ready.append(task)
+
+        return ready

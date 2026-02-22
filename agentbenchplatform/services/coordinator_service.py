@@ -28,6 +28,7 @@ from agentbenchplatform.models.memory import MemoryQuery, MemoryScope
 from agentbenchplatform.models.provider import LLMConfig, LLMMessage
 from agentbenchplatform.models.research import ResearchConfig
 from agentbenchplatform.models.session import SessionLifecycle
+from agentbenchplatform.models.task import TaskStatus
 from agentbenchplatform.models.session_report import DiffStats, SessionReport, TestResults
 from agentbenchplatform.models.usage import UsageEvent
 from agentbenchplatform.services.dashboard_service import DashboardService
@@ -414,11 +415,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "merge_session",
-        "description": "Merge a session's worktree branch into the main workspace. Use after reviewing and approving session work.",
+        "description": "Merge a session's worktree branch into the main workspace. Auto-checks for conflicts unless force=true.",
         "parameters": {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "description": "Session ID whose branch to merge"},
+                "force": {"type": "boolean", "description": "Skip conflict check and merge anyway (default false)"},
             },
             "required": ["session_id"],
         },
@@ -580,6 +582,134 @@ TOOL_DEFINITIONS = [
             "required": ["task_slug"],
         },
     },
+    # --- Dependency tools ---
+    {
+        "name": "add_dependency",
+        "description": "Add a dependency: task_slug depends on depends_on_slug. Validates both exist and detects cycles.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task that depends on another"},
+                "depends_on_slug": {"type": "string", "description": "Task that must complete first"},
+            },
+            "required": ["task_slug", "depends_on_slug"],
+        },
+    },
+    {
+        "name": "remove_dependency",
+        "description": "Remove a dependency between two tasks",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task to remove dependency from"},
+                "depends_on_slug": {"type": "string", "description": "Dependency to remove"},
+            },
+            "required": ["task_slug", "depends_on_slug"],
+        },
+    },
+    {
+        "name": "get_task_dependencies",
+        "description": "Get dependency info: direct deps, transitive deps, and blocking (unsatisfied) deps",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_slug": {"type": "string", "description": "Task slug"},
+            },
+            "required": ["task_slug"],
+        },
+    },
+    {
+        "name": "get_ready_tasks",
+        "description": "List active tasks with all dependencies satisfied (ready to work on)",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    # --- Conflict detection tools ---
+    {
+        "name": "check_conflicts",
+        "description": "Check if a session's changed files overlap with other sessions for the same task",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID to check"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    # --- Rollback tools ---
+    {
+        "name": "rollback_session",
+        "description": "Revert a previously merged session by git-reverting its merge commit",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "description": "Session ID whose merge to revert"},
+            },
+            "required": ["session_id"],
+        },
+    },
+    # --- Progress estimation tools ---
+    {
+        "name": "estimate_duration",
+        "description": "Estimate session duration based on historical data. Returns avg, count, p90. If session_id given, shows elapsed + estimated remaining.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "Agent backend to filter by (optional)"},
+                "complexity": {"type": "string", "description": "Complexity tier to filter by (optional)"},
+                "session_id": {"type": "string", "description": "Running session ID to estimate remaining time (optional)"},
+            },
+        },
+    },
+    # --- Playbook tools ---
+    {
+        "name": "list_playbooks",
+        "description": "List all available playbooks/templates",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "create_playbook",
+        "description": "Create a reusable playbook with steps (create_task, start_session, review_session, merge_session)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Playbook name (unique)"},
+                "description": {"type": "string", "description": "What this playbook does"},
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["create_task", "start_session", "review_session", "merge_session"]},
+                            "params": {"type": "object", "description": "Action-specific parameters"},
+                        },
+                        "required": ["action", "params"],
+                    },
+                    "description": "Ordered list of steps",
+                },
+                "workspace_path": {"type": "string", "description": "Default workspace path for tasks"},
+            },
+            "required": ["name", "description", "steps"],
+        },
+    },
+    {
+        "name": "run_playbook",
+        "description": "Execute a playbook. Creates tasks/sessions as defined. Use dry_run=true to preview without executing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "playbook_name": {"type": "string", "description": "Playbook name"},
+                "workspace_path": {"type": "string", "description": "Override workspace path (optional)"},
+                "dry_run": {"type": "boolean", "description": "Preview without executing (default false)"},
+            },
+            "required": ["playbook_name"],
+        },
+    },
 ]
 
 # Agent tier ordering for escalation
@@ -609,6 +739,9 @@ class CoordinatorService:
         conversation_summary_repo: ConversationSummaryRepo | None = None,
         agent_event_repo: AgentEventRepo | None = None,
         workspace_repo: WorkspaceRepo | None = None,
+        merge_record_repo=None,
+        session_metric_repo=None,
+        playbook_repo=None,
     ) -> None:
         self._dashboard = dashboard_service
         self._session = session_service
@@ -623,6 +756,9 @@ class CoordinatorService:
         self._conversation_summary_repo = conversation_summary_repo
         self._agent_event_repo = agent_event_repo
         self._workspace_repo = workspace_repo
+        self._merge_record_repo = merge_record_repo
+        self._session_metric_repo = session_metric_repo
+        self._playbook_repo = playbook_repo
         self._signal = None  # set via set_signal_service()
         self._provider = get_provider_with_fallback(config, config.coordinator.provider)
         self._llm_config = LLMConfig(
@@ -630,6 +766,7 @@ class CoordinatorService:
             max_tokens=4096,
             temperature=0.7,
             tools=TOOL_DEFINITIONS,
+            provider_order=config.coordinator.provider_order,
         )
         self._conversations: dict[str, list[LLMMessage]] = {}
         self._watchdog_task: asyncio.Task | None = None
@@ -1213,6 +1350,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                         "workspace_path": t.workspace_path,
                         "tags": list(t.tags),
                         "complexity": t.complexity,
+                        "depends_on": list(t.depends_on),
                     }
                     for t in tasks
                 ]
@@ -1564,6 +1702,16 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 task = await self._task.get_task_by_id(session.task_id)
                 if not task or not task.workspace_path:
                     return {"error": "Task has no workspace_path — cannot determine merge target"}
+                # Auto-check conflicts unless force=True
+                force = arguments.get("force", False)
+                if not force:
+                    conflict_result = await self._check_session_conflicts_tool(arguments["session_id"])
+                    if conflict_result.get("has_conflicts"):
+                        return {
+                            "merged": False,
+                            "warning": "Conflicting file changes detected. Use force=true to merge anyway.",
+                            "conflicts": conflict_result["conflicts"],
+                        }
                 # Get the branch name from the worktree
                 branch_proc = await asyncio.create_subprocess_exec(
                     "git", "rev-parse", "--abbrev-ref", "HEAD",
@@ -1576,6 +1724,19 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 if not branch_name:
                     return {"error": "Could not determine session branch name"}
                 result = await git_ops.merge_branch(task.workspace_path, branch_name)
+                # Record merge for rollback support
+                if self._merge_record_repo:
+                    try:
+                        merge_sha = await git_ops.get_head_sha(task.workspace_path)
+                        from agentbenchplatform.models.merge_record import MergeRecord
+                        await self._merge_record_repo.insert(MergeRecord(
+                            session_id=session.id,
+                            task_id=session.task_id,
+                            branch_name=branch_name,
+                            merge_commit_sha=merge_sha,
+                        ))
+                    except Exception:
+                        logger.debug("Failed to record merge", exc_info=True)
                 return {"merged": True, "branch": branch_name, "output": result}
 
             # --- Phase 3 tool handlers ---
@@ -1759,6 +1920,63 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     for m in results
                 ]
 
+            # --- Dependency tool handlers ---
+
+            elif name == "add_dependency":
+                task = await self._task.add_dependency(
+                    arguments["task_slug"], arguments["depends_on_slug"],
+                )
+                return {"added": True, "slug": task.slug, "depends_on": list(task.depends_on)}
+
+            elif name == "remove_dependency":
+                task = await self._task.remove_dependency(
+                    arguments["task_slug"], arguments["depends_on_slug"],
+                )
+                return {"removed": True, "slug": task.slug, "depends_on": list(task.depends_on)}
+
+            elif name == "get_task_dependencies":
+                deps = await self._task.get_task_dependencies(arguments["task_slug"])
+                return deps
+
+            elif name == "get_ready_tasks":
+                tasks = await self._task.get_ready_tasks()
+                return [
+                    {
+                        "slug": t.slug,
+                        "title": t.title,
+                        "status": t.status.value,
+                        "depends_on": list(t.depends_on),
+                        "complexity": t.complexity,
+                    }
+                    for t in tasks
+                ]
+
+            # --- Conflict detection tool handler ---
+
+            elif name == "check_conflicts":
+                return await self._check_session_conflicts_tool(arguments["session_id"])
+
+            # --- Rollback tool handler ---
+
+            elif name == "rollback_session":
+                return await self._handle_rollback_session(arguments["session_id"])
+
+            # --- Progress estimation tool handler ---
+
+            elif name == "estimate_duration":
+                return await self._handle_estimate_duration(arguments)
+
+            # --- Playbook tool handlers ---
+
+            elif name == "list_playbooks":
+                return await self._handle_list_playbooks()
+
+            elif name == "create_playbook":
+                return await self._handle_create_playbook(arguments)
+
+            elif name == "run_playbook":
+                return await self._handle_run_playbook(arguments)
+
             else:
                 return {"error": f"Unknown tool: {name}"}
 
@@ -1863,6 +2081,9 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             except Exception:
                 logger.warning("Failed to store session report", exc_info=True)
 
+        # Record session metric for progress estimation
+        await self._record_session_metric(session, status)
+
         result: dict[str, Any] = {
             "session_id": session_id,
             "status": status,
@@ -1878,6 +2099,12 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             escalation = await self._auto_escalate(session, summary)
             if escalation:
                 result["escalation"] = escalation
+
+        # 8. Auto-unblock: check if downstream tasks are now unblocked
+        if status == "success":
+            unblocked = await self._check_auto_unblock(session.task_id)
+            if unblocked:
+                result["unblocked_tasks"] = unblocked
 
         return result
 
@@ -1953,8 +2180,278 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 diff_stats=diff_stats,
             )
             await self._session_report_repo.insert(report)
+            # Record session metric
+            await self._record_session_metric(session)
         except Exception:
             logger.debug("Failed to auto-generate report on stop", exc_info=True)
+
+    # --- Session Metrics ---
+
+    async def _record_session_metric(self, session, status: str = "success") -> None:
+        """Record a session duration metric for progress estimation."""
+        if not self._session_metric_repo:
+            return
+        try:
+            duration = (datetime.now(timezone.utc) - session.created_at).total_seconds()
+            # Look up task complexity
+            complexity = ""
+            try:
+                task = await self._task.get_task_by_id(session.task_id)
+                if task:
+                    complexity = task.complexity
+            except Exception:
+                pass
+
+            from agentbenchplatform.models.session_metric import SessionMetric
+            await self._session_metric_repo.insert(SessionMetric(
+                session_id=session.id,
+                task_id=session.task_id,
+                agent_backend=session.agent_backend,
+                complexity=complexity,
+                status=status,
+                duration_seconds=int(duration),
+            ))
+        except Exception:
+            logger.debug("Failed to record session metric", exc_info=True)
+
+    # --- Auto-Unblock ---
+
+    async def _check_auto_unblock(self, task_id: str) -> list[str]:
+        """Check if completing a task unblocks downstream tasks."""
+        try:
+            task = await self._task.get_task_by_id(task_id)
+            if not task:
+                return []
+            downstream = await self._task.get_downstream_tasks(task.slug)
+            unblocked: list[str] = []
+            for dt in downstream:
+                if dt.status != TaskStatus.ACTIVE:
+                    continue
+                deps = await self._task.get_task_dependencies(dt.slug)
+                if not deps["blocking"]:
+                    unblocked.append(dt.slug)
+                    await self._emit_event(
+                        "", task_id,
+                        AgentEventType.NEEDS_HELP,
+                        f"Task '{dt.slug}' is now unblocked — all dependencies satisfied",
+                    )
+            return unblocked
+        except Exception:
+            logger.debug("Auto-unblock check failed", exc_info=True)
+            return []
+
+    # --- Conflict Detection ---
+
+    async def _check_session_conflicts_tool(self, session_id: str) -> dict:
+        """Check for file conflicts between sessions on the same task."""
+        session = await self._session.get_session(session_id)
+        if not session:
+            return {"error": "Session not found"}
+        if not session.worktree_path:
+            return {"error": "Session has no worktree"}
+
+        try:
+            my_files = await git_ops.get_branch_changed_files(session.worktree_path)
+        except Exception as e:
+            return {"error": f"Could not get changed files: {e}"}
+
+        # Find other sessions for the same task
+        all_sessions = await self._session.list_sessions(task_id=session.task_id)
+        conflicts: list[dict] = []
+        for other in all_sessions:
+            if other.id == session_id or not other.worktree_path:
+                continue
+            if other.lifecycle not in (SessionLifecycle.RUNNING, SessionLifecycle.STOPPED):
+                continue
+            try:
+                other_files = await git_ops.get_branch_changed_files(other.worktree_path)
+                overlap = set(my_files) & set(other_files)
+                if overlap:
+                    conflicts.append({
+                        "session_id": other.id,
+                        "overlapping_files": sorted(overlap),
+                    })
+            except Exception:
+                continue
+
+        return {"has_conflicts": len(conflicts) > 0, "conflicts": conflicts}
+
+    # --- Rollback Handler ---
+
+    async def _handle_rollback_session(self, session_id: str) -> dict:
+        """Revert a previously merged session."""
+        if not self._merge_record_repo:
+            return {"error": "Merge record repo not available"}
+
+        record = await self._merge_record_repo.find_by_session(session_id)
+        if not record:
+            return {"error": f"No merge record found for session: {session_id}"}
+        if record.reverted:
+            return {"error": "This merge has already been reverted"}
+
+        # Find the task to get workspace path
+        task = await self._task.get_task_by_id(record.task_id)
+        if not task or not task.workspace_path:
+            return {"error": "Task has no workspace_path — cannot revert"}
+
+        try:
+            revert_sha = await git_ops.revert_merge(task.workspace_path, record.merge_commit_sha)
+            await self._merge_record_repo.mark_reverted(session_id, revert_sha)
+            return {"reverted": True, "revert_commit": revert_sha, "session_id": session_id}
+        except Exception as e:
+            return {"error": f"Git revert failed: {e}"}
+
+    # --- Progress Estimation Handler ---
+
+    async def _handle_estimate_duration(self, arguments: dict) -> dict:
+        """Estimate session duration from historical data."""
+        if not self._session_metric_repo:
+            return {"error": "Session metric repo not available"}
+
+        session_id = arguments.get("session_id")
+        if session_id:
+            # Estimate remaining time for a running session
+            session = await self._session.get_session(session_id)
+            if not session:
+                return {"error": "Session not found"}
+            elapsed = (datetime.now(timezone.utc) - session.created_at).total_seconds()
+            stats = await self._session_metric_repo.get_stats(
+                agent=session.agent_backend,
+                complexity=arguments.get("complexity"),
+            )
+            if stats["sample_count"] < 3:
+                return {"insufficient_data": True, "elapsed_seconds": int(elapsed), "sample_count": stats["sample_count"]}
+            remaining = max(0, stats["avg_seconds"] - elapsed)
+            return {
+                "elapsed_seconds": int(elapsed),
+                "estimated_remaining_seconds": int(remaining),
+                "avg_seconds": stats["avg_seconds"],
+                "p90_seconds": stats["p90_seconds"],
+                "sample_count": stats["sample_count"],
+            }
+
+        # General stats
+        stats = await self._session_metric_repo.get_stats(
+            agent=arguments.get("agent"),
+            complexity=arguments.get("complexity"),
+        )
+        if stats["sample_count"] < 3:
+            return {"insufficient_data": True, "sample_count": stats["sample_count"]}
+        return stats
+
+    # --- Playbook Handlers ---
+
+    async def _handle_list_playbooks(self) -> list[dict]:
+        """List all playbooks."""
+        if not self._playbook_repo:
+            return {"error": "Playbook repo not available"}
+        playbooks = await self._playbook_repo.list_all()
+        return [
+            {
+                "name": p.name,
+                "description": p.description,
+                "steps": len(p.steps),
+                "workspace_path": p.workspace_path,
+                "tags": list(p.tags),
+            }
+            for p in playbooks
+        ]
+
+    async def _handle_create_playbook(self, arguments: dict) -> dict:
+        """Create a new playbook."""
+        if not self._playbook_repo:
+            return {"error": "Playbook repo not available"}
+
+        from agentbenchplatform.models.playbook import Playbook, PlaybookStep
+
+        steps = tuple(
+            PlaybookStep(action=s["action"], params=s.get("params", {}))
+            for s in arguments["steps"]
+        )
+        playbook = Playbook(
+            name=arguments["name"],
+            description=arguments.get("description", ""),
+            steps=steps,
+            workspace_path=arguments.get("workspace_path", ""),
+        )
+        saved = await self._playbook_repo.insert(playbook)
+        return {"created": True, "name": saved.name}
+
+    async def _handle_run_playbook(self, arguments: dict) -> dict:
+        """Execute a playbook, creating tasks and sessions."""
+        if not self._playbook_repo:
+            return {"error": "Playbook repo not available"}
+
+        playbook = await self._playbook_repo.find_by_name(arguments["playbook_name"])
+        if not playbook:
+            return {"error": f"Playbook not found: {arguments['playbook_name']}"}
+
+        workspace_path = arguments.get("workspace_path") or playbook.workspace_path
+        dry_run = arguments.get("dry_run", False)
+
+        results: list[dict] = []
+        task_slugs: dict[int, str] = {}  # step_index -> task_slug
+
+        for i, step in enumerate(playbook.steps):
+            if dry_run:
+                results.append({"step": i, "action": step.action, "params": step.params, "dry_run": True})
+                continue
+
+            if step.action == "create_task":
+                deps = ()
+                if dep_step := step.params.get("depends_on_step"):
+                    dep_slug = task_slugs.get(dep_step)
+                    if dep_slug:
+                        deps = (dep_slug,)
+                try:
+                    task = await self._task.create_task(
+                        title=step.params.get("title", f"Playbook step {i}"),
+                        description=step.params.get("description", ""),
+                        workspace_path=step.params.get("workspace_path", workspace_path),
+                        complexity=step.params.get("complexity", ""),
+                        depends_on=deps,
+                    )
+                    task_slugs[i] = task.slug
+                    results.append({"step": i, "action": "create_task", "slug": task.slug})
+                except Exception as e:
+                    results.append({"step": i, "action": "create_task", "error": str(e)})
+
+            elif step.action == "start_session":
+                task_ref = step.params.get("task_ref")
+                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
+                if not task_slug:
+                    results.append({"step": i, "action": "start_session", "error": "Task ref not found"})
+                    continue
+                try:
+                    result = await self._execute_tool("start_coding_session", {
+                        "task_slug": task_slug,
+                        "agent": step.params.get("agent", ""),
+                        "prompt": step.params.get("prompt", ""),
+                    })
+                    results.append({"step": i, "action": "start_session", **result})
+                except Exception as e:
+                    results.append({"step": i, "action": "start_session", "error": str(e)})
+
+            elif step.action == "review_session":
+                task_ref = step.params.get("task_ref")
+                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
+                results.append({
+                    "step": i, "action": "review_session",
+                    "note": "Review will run when session completes",
+                    "task_slug": task_slug,
+                    "test_command": step.params.get("test_command", ""),
+                })
+
+            elif step.action == "merge_session":
+                task_ref = step.params.get("task_ref")
+                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
+                results.append({
+                    "step": i, "action": "merge_session",
+                    "note": "Merge will run after review",
+                    "task_slug": task_slug,
+                })
+
+        return {"playbook": playbook.name, "steps_executed": len(results), "results": results}
 
     # --- Decision Logging ---
 

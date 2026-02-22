@@ -34,6 +34,7 @@ class Task:
     workspace_path: str = ""
     tags: tuple[str, ...] = ()
     complexity: str = ""  # "", "junior", "mid", "senior"
+    depends_on: tuple[str, ...] = ()  # slugs of tasks this task depends on
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     id: str | None = None
@@ -52,6 +53,7 @@ class Task:
         workspace_path: str = "",
         tags: tuple[str, ...] = (),
         complexity: str = "",
+        depends_on: tuple[str, ...] = (),
     ) -> Task:
         """Create a new task, auto-generating slug from title."""
         slug = _slugify(title)
@@ -64,6 +66,7 @@ class Task:
             workspace_path=workspace_path,
             tags=tags,
             complexity=complexity,
+            depends_on=depends_on,
         )
 
     def with_status(self, status: TaskStatus) -> Task:
@@ -77,6 +80,7 @@ class Task:
             workspace_path=self.workspace_path,
             tags=self.tags,
             complexity=self.complexity,
+            depends_on=self.depends_on,
             created_at=self.created_at,
             updated_at=now,
             id=self.id,
@@ -92,6 +96,7 @@ class Task:
             "workspace_path": self.workspace_path,
             "tags": list(self.tags),
             "complexity": self.complexity,
+            "depends_on": list(self.depends_on),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -111,6 +116,7 @@ class Task:
             workspace_path=doc.get("workspace_path", ""),
             tags=tuple(doc.get("tags", [])),
             complexity=doc.get("complexity", ""),
+            depends_on=tuple(doc.get("depends_on", [])),
             created_at=doc.get("created_at", datetime.now(timezone.utc)),
             updated_at=doc.get("updated_at", datetime.now(timezone.utc)),
         )

@@ -108,6 +108,54 @@ async def merge_branch(workspace_path: str, branch_name: str) -> str:
     return result
 
 
+async def get_branch_changed_files(worktree_path: str) -> list[str]:
+    """Get list of files changed in the current branch vs its merge base with HEAD."""
+    # Find the merge base
+    proc = await asyncio.create_subprocess_exec(
+        "git", "diff", "--name-only", "HEAD",
+        cwd=worktree_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    files = [f for f in stdout.decode(errors="replace").strip().splitlines() if f]
+    return files
+
+
+async def get_head_sha(path: str) -> str:
+    """Get the HEAD commit SHA."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "HEAD",
+        cwd=path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    sha = stdout.decode().strip()
+    if proc.returncode != 0 or not sha:
+        raise RuntimeError("Could not get HEAD SHA")
+    return sha
+
+
+async def revert_merge(workspace_path: str, merge_sha: str) -> str:
+    """Revert a merge commit. Returns the revert commit SHA."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "revert", "--no-edit", "-m", "1", merge_sha,
+        cwd=workspace_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        error_msg = stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"git revert failed: {error_msg}")
+
+    revert_sha = await get_head_sha(workspace_path)
+    logger.info("Reverted merge %s -> %s in %s", merge_sha, revert_sha, workspace_path)
+    return revert_sha
+
+
 async def remove_worktree(workspace_path: str, worktree_path: str) -> bool:
     """Remove a git worktree. Returns True on success."""
     if not worktree_path:

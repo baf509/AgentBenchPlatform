@@ -104,3 +104,52 @@ class TestTask:
         assert restored.slug == task.slug
         assert restored.title == task.title
         assert restored.status == task.status
+
+    def test_depends_on(self):
+        task = Task.create("Child Task", depends_on=("parent-task",))
+        assert task.depends_on == ("parent-task",)
+
+    def test_depends_on_to_doc(self):
+        task = Task.create("Child Task", depends_on=("parent-1", "parent-2"))
+        doc = task.to_doc()
+        assert doc["depends_on"] == ["parent-1", "parent-2"]
+
+    def test_depends_on_from_doc(self):
+        from bson import ObjectId
+
+        doc = {
+            "_id": ObjectId(),
+            "slug": "child",
+            "title": "Child",
+            "status": "active",
+            "depends_on": ["parent-1", "parent-2"],
+        }
+        task = Task.from_doc(doc)
+        assert task.depends_on == ("parent-1", "parent-2")
+
+    def test_depends_on_backward_compat(self):
+        """Old documents without depends_on should deserialize with empty tuple."""
+        from bson import ObjectId
+
+        doc = {
+            "_id": ObjectId(),
+            "slug": "old-task",
+            "title": "Old Task",
+            "status": "active",
+        }
+        task = Task.from_doc(doc)
+        assert task.depends_on == ()
+
+    def test_with_status_preserves_depends_on(self):
+        task = Task.create("Test", depends_on=("dep-1",))
+        archived = task.with_status(TaskStatus.ARCHIVED)
+        assert archived.depends_on == ("dep-1",)
+
+    def test_depends_on_roundtrip(self):
+        from bson import ObjectId
+
+        task = Task.create("Dep Test", depends_on=("a", "b"))
+        doc = task.to_doc()
+        doc["_id"] = ObjectId()
+        restored = Task.from_doc(doc)
+        assert restored.depends_on == ("a", "b")

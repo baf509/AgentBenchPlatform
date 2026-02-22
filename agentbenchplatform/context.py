@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from agentbenchplatform.infra.db.sessions import SessionRepo
     from agentbenchplatform.infra.db.tasks import TaskRepo
     from agentbenchplatform.infra.db.usage import UsageRepo
+    from agentbenchplatform.infra.db.merge_records import MergeRecordRepo
+    from agentbenchplatform.infra.db.playbooks import PlaybookRepo
+    from agentbenchplatform.infra.db.session_metrics import SessionMetricRepo
     from agentbenchplatform.infra.db.workspaces import WorkspaceRepo
     from agentbenchplatform.services.coordinator_service import CoordinatorService
     from agentbenchplatform.services.dashboard_service import DashboardService
@@ -53,6 +56,9 @@ class AppContext:
         self._coordinator_decision_repo: CoordinatorDecisionRepo | None = None
         self._conversation_summary_repo: ConversationSummaryRepo | None = None
         self._agent_event_repo: AgentEventRepo | None = None
+        self._merge_record_repo: MergeRecordRepo | None = None
+        self._session_metric_repo: SessionMetricRepo | None = None
+        self._playbook_repo: PlaybookRepo | None = None
         self._task_service: TaskService | None = None
         self._session_service: SessionService | None = None
         self._memory_service: MemoryService | None = None
@@ -179,6 +185,30 @@ class AppContext:
         return self._agent_event_repo
 
     @property
+    def merge_record_repo(self) -> MergeRecordRepo:
+        if self._merge_record_repo is None:
+            from agentbenchplatform.infra.db.merge_records import MergeRecordRepo
+
+            self._merge_record_repo = MergeRecordRepo(self.mongo.db)
+        return self._merge_record_repo
+
+    @property
+    def session_metric_repo(self) -> SessionMetricRepo:
+        if self._session_metric_repo is None:
+            from agentbenchplatform.infra.db.session_metrics import SessionMetricRepo
+
+            self._session_metric_repo = SessionMetricRepo(self.mongo.db)
+        return self._session_metric_repo
+
+    @property
+    def playbook_repo(self) -> PlaybookRepo:
+        if self._playbook_repo is None:
+            from agentbenchplatform.infra.db.playbooks import PlaybookRepo
+
+            self._playbook_repo = PlaybookRepo(self.mongo.db)
+        return self._playbook_repo
+
+    @property
     def task_service(self) -> TaskService:
         if self._task_service is None:
             from agentbenchplatform.services.task_service import TaskService
@@ -262,6 +292,9 @@ class AppContext:
                 conversation_summary_repo=self.conversation_summary_repo,
                 agent_event_repo=self.agent_event_repo,
                 workspace_repo=self.workspace_repo,
+                merge_record_repo=self.merge_record_repo,
+                session_metric_repo=self.session_metric_repo,
+                playbook_repo=self.playbook_repo,
             )
             # If signal service already exists, wire it in
             if self._signal_service is not None:

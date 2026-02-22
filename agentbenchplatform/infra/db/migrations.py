@@ -82,10 +82,29 @@ async def run_migrations(db) -> None:
         [("task_id", pymongo.ASCENDING), ("source", pymongo.ASCENDING)]
     )
 
+    # Task depends_on index
+    await tasks.create_index([("depends_on", pymongo.ASCENDING)])
+
+    # Merge records indexes
+    merge_records = db["merge_records"]
+    await merge_records.create_index([("session_id", pymongo.ASCENDING)], unique=True)
+    await merge_records.create_index([("task_id", pymongo.ASCENDING)])
+
+    # Session metrics indexes
+    session_metrics = db["session_metrics"]
+    await session_metrics.create_index([("session_id", pymongo.ASCENDING)], unique=True)
+    await session_metrics.create_index(
+        [("agent_backend", pymongo.ASCENDING), ("complexity", pymongo.ASCENDING)]
+    )
+
+    # Playbooks indexes
+    playbooks = db["playbooks"]
+    await playbooks.create_index([("name", pymongo.ASCENDING)], unique=True)
+
     logger.info("MongoDB migrations complete")
 
 
-async def create_vector_search_index(db, dimensions: int = 768) -> None:
+async def create_vector_search_index(db, dimensions: int = 1024) -> None:
     """Create the vector search index for the memories collection.
 
     NOTE: This requires MongoDB Atlas or a local deployment with
