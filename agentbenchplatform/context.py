@@ -70,14 +70,13 @@ class AppContext:
 
     async def initialize(self) -> None:
         """Initialize the database connection and run migrations."""
-        from agentbenchplatform.infra.db.migrations import create_vector_search_index, run_migrations
+        from agentbenchplatform.infra.db.migrations import run_migrations
 
         self._mongo = MongoClient(
             uri=self.config.mongodb.uri,
             database=self.config.mongodb.database,
         )
         await run_migrations(self._mongo.db)
-        await create_vector_search_index(self._mongo.db, self.config.embeddings.dimensions)
         logger.info("AppContext initialized")
 
     async def close(self) -> None:

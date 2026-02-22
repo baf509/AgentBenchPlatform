@@ -20,16 +20,6 @@ error() { echo -e "${RED}[x]${NC} $*"; }
 # -----------------------------------------------------------
 info "Checking prerequisites..."
 
-if ! command -v docker &>/dev/null; then
-    error "docker not found. Install Docker Desktop: https://www.docker.com/products/docker-desktop"
-    exit 1
-fi
-
-if ! docker info &>/dev/null; then
-    error "Docker daemon is not running. Start Docker Desktop first."
-    exit 1
-fi
-
 if ! command -v python3 &>/dev/null; then
     error "python3 not found."
     exit 1
@@ -38,22 +28,20 @@ fi
 info "Prerequisites OK"
 
 # -----------------------------------------------------------
-# 2. Start MongoDB via Docker Compose
+# 2. Check shared infrastructure MongoDB is running
 # -----------------------------------------------------------
-info "Starting MongoDB (Atlas Local with vector search)..."
-docker compose up -d
+info "Checking shared infrastructure MongoDB..."
 
-info "Waiting for MongoDB to be healthy..."
-RETRIES=30
-until docker compose exec -T mongodb mongosh --quiet --eval "db.adminCommand('ping')" &>/dev/null; do
-    RETRIES=$((RETRIES - 1))
-    if [ "$RETRIES" -le 0 ]; then
-        error "MongoDB failed to start. Check: docker compose logs mongodb"
-        exit 1
-    fi
-    sleep 2
-done
-info "MongoDB is ready"
+if ! mongosh --port 27017 --quiet --eval "rs.status().ok" &>/dev/null 2>&1; then
+    error "Shared MongoDB is not running on port 27017."
+    echo ""
+    echo "  Start the shared infrastructure first:"
+    echo "    cd /home/ben/Dev/infrastructure && docker compose up -d"
+    echo ""
+    exit 1
+fi
+
+info "Shared MongoDB is ready"
 
 # -----------------------------------------------------------
 # 3. Set up Python venv if needed
@@ -97,25 +85,7 @@ asyncio.run(migrate())
 "
 
 # -----------------------------------------------------------
-# 6. Create vector search index
-# -----------------------------------------------------------
-info "Creating vector search index..."
-python -c "
-import asyncio
-from agentbenchplatform.context import AppContext
-from agentbenchplatform.infra.db.migrations import create_vector_search_index
-
-async def create_index():
-    ctx = AppContext()
-    await ctx.initialize()
-    await create_vector_search_index(ctx.mongo.db, dimensions=ctx.config.embeddings.dimensions)
-    await ctx.close()
-
-asyncio.run(create_index())
-" 2>&1 || warn "Vector search index may already exist (this is OK)"
-
-# -----------------------------------------------------------
-# 7. Install systemd user service (optional)
+# 6. Install systemd user service (optional)
 # -----------------------------------------------------------
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 if [ ! -f "$SYSTEMD_DIR/agentbenchplatform.service" ]; then
@@ -134,7 +104,10 @@ info "========================================="
 info "  AgentBenchPlatform is ready!"
 info "========================================="
 echo ""
-echo "  MongoDB:  mongodb://localhost:27017/agentbenchplatform"
+echo "  Shared infra: /home/ben/Dev/infrastructure (mongod, mongot, llamacpp, embeddings)"
+echo "  MongoDB:  mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
+echo "  Embeddings: http://localhost:8001 (voyage-4-nano, 1024-dim)"
+echo "  llama.cpp:  http://localhost:8080"
 echo ""
 echo "  Quick start:"
 echo "    source .venv/bin/activate"
@@ -151,8 +124,4 @@ echo "  Set API keys for full features:"
 echo "    export OPENROUTER_API_KEY=sk-or-..."
 echo "    export ANTHROPIC_API_KEY=sk-ant-..."
 echo "    export BRAVE_SEARCH_API_KEY=BSA..."
-echo ""
-echo "  Stop MongoDB:"
-echo "    docker compose down        # stop (data persists)"
-echo "    docker compose down -v     # stop + delete data"
 echo ""
