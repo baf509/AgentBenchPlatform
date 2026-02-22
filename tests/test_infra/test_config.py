@@ -9,7 +9,7 @@ class TestConfig:
     def test_load_defaults(self):
         """Loading with no file should return defaults."""
         config = load_config(Path("/nonexistent/config.toml"))
-        assert config.mongodb.uri == "mongodb://localhost:27017/?directConnection=true"
+        assert config.mongodb.uri == "mongodb://localhost:27017/?directConnection=true&replicaSet=rs0"
         assert config.mongodb.database == "agentbenchplatform"
         assert config.default_agent == "claude_code"
         assert config.tmux.enabled is True

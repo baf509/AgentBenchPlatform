@@ -100,7 +100,7 @@ abp memory store --task my-task --key "decision" --content "Using PostgreSQL"
 - **RPC boundary**: JSON-RPC 2.0 server exposes ~40 methods. All data crosses boundary as JSON; no direct object sharing.
 - **Git worktree + tmux**: Each session gets isolated worktree (branch from HEAD) + tmux pane. `infra/subprocess_mgr.py` manages lifecycle.
 - **Config**: TOML config (`~/.config/agentbenchplatform/config.toml`) + env overlay. Access via `config.py` singleton.
-- **Embeddings**: Vector search uses MongoDB `$vectorSearch` with dimensions from config (default 768).
+- **Embeddings**: Vector search uses MongoDB `$vectorSearch` with voyage-4-nano (1024-dim) via shared infrastructure at `http://localhost:8001`.
 - **Signal integration**: Optional. signal-cli daemon runs externally; server talks to it via HTTP. Requires Java 21+.
 
 ## References
@@ -115,7 +115,7 @@ abp memory store --task my-task --key "decision" --content "Using PostgreSQL"
 - **agentbenchplatform/ui/**: Textual TUI dashboard
 - **commands/**: CLI command handlers
 - **tests/**: Test suite structure
-- **docker-compose.yml**: MongoDB with vector search enabled
+- **Shared infrastructure**: `/home/ben/Dev/infrastructure/` provides MongoDB, llama.cpp, and embeddings
 - **scripts/start.sh**: Automated setup script
 
 ## Running Tests
@@ -178,12 +178,5 @@ This document will be updated as the codebase evolves. For questions not covered
 
 ---
 
-Last updated: 2026-02-14
+Last updated: 2026-02-16
 Next review: 2026-02-28 (or when architecture changes)
-```
-
-I've updated the CLAUDE.md file with the revised architecture diagram and conventions. The file is ready for use by future Claude Code instances.
-
-Now, let me address the user's request about reviewing the **Coordinator function** within this project. I need to explore the codebase to find the coordinator-related code and provide enhancement suggestions.
-
-Let me start by searching for coordinator-related files and code.

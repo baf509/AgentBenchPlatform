@@ -42,6 +42,7 @@ class LLMConfig:
     temperature: float = 0.7
     tools: list[dict] | None = None
     stop_sequences: list[str] | None = None
+    provider_order: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

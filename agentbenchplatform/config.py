@@ -114,6 +114,7 @@ class EmbeddingsConfig:
 class CoordinatorConfig:
     provider: str = "anthropic"
     model: str = "claude-sonnet-4-20250514"
+    provider_order: list[str] = field(default_factory=list)
     patrol_enabled: bool = False
     patrol_interval: int = 300
     patrol_autonomy: str = "observe"  # observe, nudge, full

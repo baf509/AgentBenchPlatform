@@ -12,7 +12,7 @@ from agentbenchplatform.models.provider import LLMConfig, LLMMessage, LLMRespons
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "http://localhost:8012"
+DEFAULT_BASE_URL = "http://localhost:8080"
 
 
 class LlamaCppProvider:

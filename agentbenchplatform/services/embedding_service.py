@@ -1,4 +1,4 @@
-"""Embedding service: generates embeddings via llama.cpp."""
+"""Embedding service: generates embeddings via the shared voyage-4-nano service."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _RETRY_INTERVAL = 60.0  # seconds before retrying after a connection failure
 
 
 class EmbeddingService:
-    """Generates text embeddings via llama.cpp /v1/embeddings endpoint."""
+    """Generates text embeddings via the shared /v1/embeddings endpoint (voyage-4-nano)."""
 
     def __init__(self, config: EmbeddingsConfig) -> None:
         self._base_url = config.base_url.rstrip("/")

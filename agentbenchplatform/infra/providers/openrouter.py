@@ -93,6 +93,8 @@ class OpenRouterProvider:
             payload["tools"] = [{"type": "function", "function": t} for t in config.tools]
         if config.stop_sequences:
             payload["stop"] = config.stop_sequences
+        if config.provider_order:
+            payload["provider"] = {"order": config.provider_order}
 
         logger.debug("Sending request to OpenRouter with model: %s", model)
         response = await self._client.post("/chat/completions", json=payload)
@@ -161,6 +163,8 @@ class OpenRouterProvider:
             payload["tools"] = [{"type": "function", "function": t} for t in config.tools]
         if config.stop_sequences:
             payload["stop"] = config.stop_sequences
+        if config.provider_order:
+            payload["provider"] = {"order": config.provider_order}
 
         async with self._client.stream("POST", "/chat/completions", json=payload) as response:
             response.raise_for_status()

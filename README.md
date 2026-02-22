@@ -72,11 +72,17 @@ A platform for orchestrating multiple AI coding agents in parallel. Create tasks
 ### Install
 
 ```bash
+# Start shared infrastructure first (MongoDB, llama.cpp, embeddings)
+cd /home/ben/Dev/infrastructure && docker compose up -d
+
+# Then set up ABP
 git clone <repo-url> && cd AgentBenchPlatform
 ./scripts/start.sh
 ```
 
-`start.sh` handles everything: starts MongoDB via Docker, creates a virtualenv, installs the package, runs migrations, creates a default config at `~/.config/agentbenchplatform/config.toml`, and installs a systemd user service.
+`start.sh` checks that the shared MongoDB is running, creates a virtualenv, installs the package, runs migrations, creates a default config at `~/.config/agentbenchplatform/config.toml`, and installs a systemd user service.
+
+Shared infrastructure (`/home/ben/Dev/infrastructure/`) provides MongoDB (port 27017), llama.cpp (port 8080), and embeddings (port 8001) — shared with ProjectAria.
 
 ```bash
 source .venv/bin/activate
@@ -133,11 +139,11 @@ abp task list
 # Stop the server
 systemctl --user stop agentbenchplatform
 
-# Stop MongoDB (data persists)
-docker compose down
+# Stop shared infrastructure (affects ProjectAria too!)
+cd /home/ben/Dev/infrastructure && docker compose down
 
-# Stop MongoDB and delete all data
-docker compose down -v
+# Stop shared infra and delete all data
+cd /home/ben/Dev/infrastructure && docker compose down -v
 ```
 
 ---
@@ -435,13 +441,13 @@ Config file: `~/.config/agentbenchplatform/config.toml`
 |---------|-----|---------|-------------|
 | `general` | `workspace_root` | `~/agentbench-workspaces` | Default worktree parent |
 | `general` | `default_agent` | `claude_code` | Default agent backend |
-| `mongodb` | `uri` | `mongodb://localhost:27017/?directConnection=true` | MongoDB connection |
+| `mongodb` | `uri` | `mongodb://localhost:27017/?directConnection=true&replicaSet=rs0` | MongoDB connection |
 | `mongodb` | `database` | `agentbenchplatform` | Database name |
 | `providers.anthropic` | `api_key_env` | `ANTHROPIC_API_KEY` | Env var for API key |
 | `providers.openrouter` | `api_key_env` | `OPENROUTER_API_KEY` | Env var for API key |
 | `providers.llamacpp` | `opencode_model` | `llama.cpp/step3p5-flash` | Model string for OpenCode Local agent |
-| `embeddings` | `provider` | `llamacpp` | Embedding provider |
-| `embeddings` | `dimensions` | `768` | Vector dimensions |
+| `embeddings` | `provider` | `voyage-4-nano` | Embedding provider |
+| `embeddings` | `dimensions` | `1024` | Vector dimensions |
 | `coordinator` | `provider` | `anthropic` | LLM provider for coordinator |
 | `coordinator` | `model` | `claude-sonnet-4-20250514` | Model for coordinator |
 | `research` | `default_breadth` | `4` | Search breadth |
@@ -517,7 +523,7 @@ scripts/
   start.sh                  # Full setup script
   stop.sh                   # Shutdown script
   agentbenchplatform.service # systemd user service unit
-docker-compose.yml           # MongoDB Atlas Local (with vector search)
+# MongoDB provided by shared infrastructure at /home/ben/Dev/infrastructure/
 pyproject.toml               # Package metadata and dependencies
 ```
 
