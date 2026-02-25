@@ -1,4 +1,9 @@
-"""Coordinator service: meta-agent with system-wide visibility."""
+"""Coordinator service: meta-agent with system-wide visibility.
+
+Tool execution is delegated to handler functions in
+``coordinator_tools/`` via a registry, keeping this module focused
+on conversation management, watchdog, and patrol orchestration.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
 import time
 from collections.abc import Callable
@@ -13,7 +19,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agentbenchplatform.config import AppConfig
-from agentbenchplatform.infra import git as git_ops
 from agentbenchplatform.infra.db.agent_events import AgentEventRepo
 from agentbenchplatform.infra.db.conversation_summaries import ConversationSummaryRepo
 from agentbenchplatform.infra.db.coordinator_decisions import CoordinatorDecisionRepo
@@ -25,13 +30,12 @@ from agentbenchplatform.infra.providers.registry import get_provider_with_fallba
 from agentbenchplatform.models.agent_event import AgentEvent, AgentEventType
 from agentbenchplatform.models.conversation_summary import ConversationSummary
 from agentbenchplatform.models.coordinator_decision import CoordinatorDecision, ToolCallRecord
-from agentbenchplatform.models.memory import MemoryQuery, MemoryScope
 from agentbenchplatform.models.provider import LLMConfig, LLMMessage
-from agentbenchplatform.models.research import ResearchConfig
 from agentbenchplatform.models.session import SessionLifecycle
-from agentbenchplatform.models.task import TaskStatus
-from agentbenchplatform.models.session_report import DiffStats, SessionReport, TestResults
+from agentbenchplatform.models.session_report import SessionReport
 from agentbenchplatform.models.usage import UsageEvent
+from agentbenchplatform.services.coordinator_tools.context import ToolContext
+from agentbenchplatform.services.coordinator_tools.registry import get_tool_handlers
 from agentbenchplatform.services.dashboard_service import DashboardService
 from agentbenchplatform.services.memory_service import MemoryService
 from agentbenchplatform.services.research_service import ResearchService
@@ -39,6 +43,22 @@ from agentbenchplatform.services.session_service import SessionService
 from agentbenchplatform.services.task_service import TaskService
 
 logger = logging.getLogger(__name__)
+
+# Errors considered transient and worth retrying
+_RETRYABLE_ERRORS = (
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+# Try to include pymongo errors if available
+try:
+    from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout
+    _RETRYABLE_ERRORS = (*_RETRYABLE_ERRORS, AutoReconnect, ConnectionFailure, NetworkTimeout)
+except ImportError:
+    pass
+
+# Max consecutive summarization failures before aggressive truncation
+_MAX_SUMMARY_FAILURES = 3
 
 # Patterns that match common interactive prompts agents may encounter.
 # Each tuple: (compiled regex, auto_response or None, human-readable description)
@@ -748,10 +768,6 @@ TOOL_DEFINITIONS = [
     },
 ]
 
-# Agent tier ordering for escalation
-_AGENT_TIERS = {"opencode_local": 0, "opencode": 1, "claude_code": 2}
-_TIER_ORDER = ["opencode_local", "opencode", "claude_code"]
-
 
 class CoordinatorService:
     """Meta-agent with system-wide visibility and control.
@@ -810,12 +826,39 @@ class CoordinatorService:
         self._session_deadlines: dict[str, float] = {}  # session_id -> deadline timestamp
         # Output change tracking: session_id -> (output_hash, timestamp_of_last_change)
         self._session_output_hashes: dict[str, tuple[str, float]] = {}
+        # Track consecutive summarization failures per conversation key
+        self._summary_failures: dict[str, int] = {}
+
+        # Build tool context for handler dispatch
+        self._tool_ctx = ToolContext(
+            session=session_service,
+            task=task_service,
+            memory=memory_service,
+            config=config,
+            research=research_service,
+            usage_repo=usage_repo,
+            history_repo=history_repo,
+            session_report_repo=session_report_repo,
+            agent_event_repo=agent_event_repo,
+            workspace_repo=workspace_repo,
+            merge_record_repo=merge_record_repo,
+            session_metric_repo=session_metric_repo,
+            playbook_repo=playbook_repo,
+            emit_event=self._emit_event,
+            execute_tool=self._execute_tool,
+            llm_config=self._llm_config,
+            provider=self._provider,
+            session_deadlines=self._session_deadlines,
+            session_output_hashes=self._session_output_hashes,
+            conversations=self._conversations,
+        )
 
     # --- Late Binding ---
 
     def set_signal_service(self, signal_service) -> None:
         """Late-bind the signal service (avoids circular dependency)."""
         self._signal = signal_service
+        self._tool_ctx.signal = signal_service
 
     # --- Watchdog ---
 
@@ -1108,7 +1151,12 @@ class CoordinatorService:
     async def _maybe_summarize(
         self, key: str, conversation: list[LLMMessage]
     ) -> None:
-        """Summarize older messages if truncation would drop >10 messages."""
+        """Summarize older messages if truncation would drop >10 messages.
+
+        Tracks consecutive failures per conversation key. If failures exceed
+        _MAX_SUMMARY_FAILURES, falls back to aggressive truncation and emits
+        an event so the issue is visible.
+        """
         if not self._conversation_summary_repo:
             return
 
@@ -1119,6 +1167,23 @@ class CoordinatorService:
         # Count messages that would be dropped
         drop_count = len(conversation) - max_keep
         if drop_count <= 10:
+            return
+
+        # Check if summarization has been failing repeatedly
+        failure_count = self._summary_failures.get(key, 0)
+        if failure_count >= _MAX_SUMMARY_FAILURES:
+            logger.warning(
+                "Summarization for %s has failed %d times; skipping and truncating aggressively",
+                key, failure_count,
+            )
+            # Emit event for visibility
+            await self._emit_event(
+                "", "",
+                AgentEventType.ERROR,
+                f"Conversation summarization failing for {key} ({failure_count} consecutive failures)",
+            )
+            # Reset counter to retry eventually
+            self._summary_failures[key] = 0
             return
 
         # Extract the messages that will be dropped for summarization
@@ -1165,10 +1230,17 @@ class CoordinatorService:
                     existing.id, new_summary.id
                 )
 
+            # Reset failure counter on success
+            self._summary_failures.pop(key, None)
             logger.debug("Created conversation summary for %s (%d messages summarized)",
                          key, drop_count)
         except Exception:
-            logger.debug("Failed to create conversation summary", exc_info=True)
+            self._summary_failures[key] = failure_count + 1
+            logger.debug(
+                "Failed to create conversation summary (failure %d/%d)",
+                failure_count + 1, _MAX_SUMMARY_FAILURES,
+                exc_info=True,
+            )
 
     # --- Main Message Handler ---
 
@@ -1450,664 +1522,32 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
     async def _execute_tool_with_retry(
         self, name: str, arguments: dict, max_retries: int = 2
     ) -> Any:
-        """Execute a tool with retry on transient errors."""
+        """Execute a tool with retry on transient errors.
+
+        Uses exponential backoff with jitter to avoid thundering herd.
+        """
         last_error = None
         for attempt in range(max_retries + 1):
             try:
                 return await self._execute_tool(name, arguments)
-            except (TimeoutError, ConnectionError, OSError) as e:
+            except _RETRYABLE_ERRORS as e:
                 last_error = e
                 if attempt < max_retries:
-                    await asyncio.sleep(1 * (attempt + 1))  # Simple backoff
-                    logger.debug("Retrying tool %s (attempt %d): %s", name, attempt + 1, e)
+                    # Exponential backoff with jitter: base * 2^attempt + random(0, 1)
+                    delay = (1 << attempt) + random.random()
+                    await asyncio.sleep(delay)
+                    logger.debug("Retrying tool %s (attempt %d/%d): %s",
+                                 name, attempt + 1, max_retries, e)
         return {"error": f"Tool failed after {max_retries + 1} attempts: {last_error}"}
 
     async def _execute_tool(self, name: str, arguments: dict) -> Any:
-        """Execute a coordinator tool call."""
+        """Execute a coordinator tool call via the handler registry."""
         try:
-            if name == "list_tasks":
-                tasks = await self._task.list_tasks(
-                    show_all=arguments.get("show_all", False)
-                )
-                return [
-                    {
-                        "slug": t.slug,
-                        "title": t.title,
-                        "status": t.status.value,
-                        "description": t.description[:100] if t.description else "",
-                        "workspace_path": t.workspace_path,
-                        "tags": list(t.tags),
-                        "complexity": t.complexity,
-                        "depends_on": list(t.depends_on),
-                    }
-                    for t in tasks
-                ]
-
-            elif name == "list_sessions":
-                task_slug = arguments.get("task_slug", "")
-                task_id = ""
-                if task_slug:
-                    task = await self._task.get_task(task_slug)
-                    task_id = task.id if task else ""
-                sessions = await self._session.list_sessions(task_id=task_id)
-                return [
-                    {
-                        "id": s.id,
-                        "display_name": s.display_name,
-                        "kind": s.kind.value,
-                        "lifecycle": s.lifecycle.value,
-                        "task_id": s.task_id,
-                        "agent_backend": s.agent_backend,
-                        "worktree_path": s.worktree_path,
-                        "created_at": s.created_at.isoformat(),
-                        "updated_at": s.updated_at.isoformat(),
-                    }
-                    for s in sessions
-                ]
-
-            elif name == "start_coding_session":
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                session = await self._session.start_coding_session(
-                    task_id=task.id,
-                    agent_type=arguments.get("agent", ""),
-                    prompt=arguments.get("prompt", ""),
-                    workspace_path=task.workspace_path,
-                    task_tags=task.tags,
-                    task_complexity=task.complexity,
-                )
-                # Emit STARTED event
-                await self._emit_event(
-                    session.id, task.id,
-                    AgentEventType.STARTED,
-                    f"Agent {session.agent_backend} started",
-                )
-                return {"session_id": session.id, "status": session.lifecycle.value}
-
-            elif name == "stop_session":
-                session = await self._session.get_session(arguments["session_id"])
-                stopped = await self._session.stop_session(arguments["session_id"])
-                # Auto-generate basic report on stop
-                if stopped and session:
-                    await self._auto_report_on_stop(session)
-                    await self._emit_event(
-                        session.id, session.task_id,
-                        AgentEventType.COMPLETED,
-                        "Session stopped",
-                    )
-                return {"stopped": stopped is not None}
-
-            elif name == "get_session_output":
-                output = await self._session.get_session_output(
-                    arguments["session_id"],
-                    lines=arguments.get("lines", 50),
-                )
-                return {"output": output}
-
-            elif name == "search_memory":
-                task_id = ""
-                if task_slug := arguments.get("task_slug"):
-                    task = await self._task.get_task(task_slug)
-                    task_id = task.id if task else ""
-                query = MemoryQuery(
-                    query_text=arguments["query"],
-                    task_id=task_id,
-                    limit=arguments.get("limit", 10),
-                )
-                results = await self._memory.search(query)
-                return [
-                    {"key": m.key, "content": m.content[:500], "scope": m.scope.value, "id": m.id}
-                    for m in results
-                ]
-
-            elif name == "store_memory":
-                task_id = ""
-                scope = MemoryScope.GLOBAL
-                if task_slug := arguments.get("task_slug"):
-                    task = await self._task.get_task(task_slug)
-                    if task:
-                        task_id = task.id
-                        scope = MemoryScope.TASK
-                session_id = arguments.get("session_id", "")
-                if session_id:
-                    scope = MemoryScope.SESSION
-                entry = await self._memory.store(
-                    key=arguments["key"],
-                    content=arguments["content"],
-                    scope=scope,
-                    task_id=task_id,
-                    session_id=session_id,
-                    content_type=arguments.get("content_type", "text"),
-                    metadata=arguments.get("metadata"),
-                )
-                return {"stored": True, "id": entry.id}
-
-            elif name == "create_task":
-                task = await self._task.create_task(
-                    title=arguments["title"],
-                    description=arguments.get("description", ""),
-                    workspace_path=arguments.get("workspace_path", ""),
-                    tags=tuple(arguments.get("tags", [])),
-                    complexity=arguments.get("complexity", ""),
-                )
-                return {"slug": task.slug, "id": task.id}
-
-            elif name == "delete_task":
-                task = await self._task.delete_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                return {"deleted": True, "slug": task.slug}
-
-            elif name == "start_research":
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                if not self._research:
-                    return {"error": "Research service not available"}
-
-                research_config = ResearchConfig(
-                    query=arguments["query"],
-                    breadth=arguments.get("breadth", 4),
-                    depth=arguments.get("depth", 3),
-                    provider=self._config.research.default_provider,
-                    search_provider=self._config.research.default_search,
-                )
-                session = await self._research.start_research(
-                    task_id=task.id,
-                    research_config=research_config,
-                )
-                return {
-                    "started": True,
-                    "session_id": session.id,
-                    "query": arguments["query"],
-                }
-
-            elif name == "get_research_status":
-                session = await self._session.get_session(arguments["session_id"])
-                if not session:
-                    return {"error": "Session not found"}
-                rp = session.research_progress
-                return {
-                    "lifecycle": session.lifecycle.value,
-                    "progress": rp.to_doc() if rp else None,
-                }
-
-            elif name == "send_to_session":
-                success = await self._session.send_to_session(
-                    arguments["session_id"], arguments["text"]
-                )
-                return {"sent": success}
-
-            elif name == "get_session_diff":
-                try:
-                    diff = await self._session.get_session_diff(
-                        arguments["session_id"]
-                    )
-                except Exception:
-                    # Fallback to git status if diff fails
-                    diff = await self._session.run_in_worktree(
-                        arguments["session_id"], "git status --short"
-                    )
-                return {"diff": diff or "(no changes)"}
-
-            elif name == "run_in_worktree":
-                output = await self._session.run_in_worktree(
-                    arguments["session_id"], arguments["command"]
-                )
-                return {"output": output}
-
-            # --- New tool handlers ---
-
-            elif name == "review_session":
-                return await self._handle_review_session(arguments)
-
-            elif name == "pause_session":
-                session = await self._session.pause_session(arguments["session_id"])
-                return {"paused": session is not None}
-
-            elif name == "resume_session":
-                session = await self._session.resume_session(arguments["session_id"])
-                return {"resumed": session is not None}
-
-            elif name == "get_session_report":
-                if not self._session_report_repo:
-                    return {"error": "Session report repo not available"}
-                report = await self._session_report_repo.find_by_session(
-                    arguments["session_id"]
-                )
-                if not report:
-                    return {"error": "No report found for this session"}
-                return {
-                    "session_id": report.session_id,
-                    "status": report.status,
-                    "summary": report.summary,
-                    "files_changed": list(report.files_changed),
-                    "test_results": report.test_results.to_doc() if report.test_results else None,
-                    "diff_stats": report.diff_stats.to_doc() if report.diff_stats else None,
-                    "agent_notes": report.agent_notes,
-                }
-
-            elif name == "list_agent_events":
-                if not self._agent_event_repo:
-                    return {"error": "Agent event repo not available"}
-                events = await self._agent_event_repo.list_unacknowledged(
-                    event_types=arguments.get("event_types"),
-                    limit=arguments.get("limit", 20),
-                )
-                return [
-                    {
-                        "id": e.id,
-                        "session_id": e.session_id,
-                        "event_type": e.event_type.value,
-                        "detail": e.detail,
-                        "created_at": e.created_at.isoformat(),
-                    }
-                    for e in events
-                ]
-
-            elif name == "acknowledge_events":
-                if not self._agent_event_repo:
-                    return {"error": "Agent event repo not available"}
-                count = await self._agent_event_repo.acknowledge(
-                    arguments["event_ids"]
-                )
-                return {"acknowledged": count}
-
-            elif name == "set_session_deadline":
-                sid = arguments["session_id"]
-                minutes = arguments["minutes"]
-                self._session_deadlines[sid] = time.time() + (minutes * 60)
-                return {"deadline_set": True, "session_id": sid, "minutes": minutes}
-
-            # --- Phase 2 tool handlers ---
-
-            elif name == "get_task_detail":
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                return {
-                    "slug": task.slug,
-                    "title": task.title,
-                    "status": task.status.value,
-                    "description": task.description,
-                    "workspace_path": task.workspace_path,
-                    "tags": list(task.tags),
-                    "complexity": task.complexity,
-                    "created_at": task.created_at.isoformat(),
-                    "updated_at": task.updated_at.isoformat(),
-                    "id": task.id,
-                }
-
-            elif name == "update_task":
-                task = await self._task.update_task(
-                    slug=arguments["task_slug"],
-                    description=arguments.get("description"),
-                    workspace_path=arguments.get("workspace_path"),
-                    tags=tuple(arguments["tags"]) if "tags" in arguments else None,
-                    complexity=arguments.get("complexity"),
-                )
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                return {"updated": True, "slug": task.slug}
-
-            elif name == "archive_task":
-                task = await self._task.archive_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                return {"archived": True, "slug": task.slug}
-
-            elif name == "list_memories":
-                task_id = ""
-                if task_slug := arguments.get("task_slug"):
-                    task = await self._task.get_task(task_slug)
-                    task_id = task.id if task else ""
-                scope = MemoryScope(arguments["scope"]) if arguments.get("scope") else None
-                memories = await self._memory.list_memories(
-                    task_id=task_id, scope=scope,
-                )
-                limit = arguments.get("limit", 20)
-                return [
-                    {
-                        "id": m.id,
-                        "key": m.key,
-                        "content": m.content[:500],
-                        "scope": m.scope.value,
-                        "task_id": m.task_id,
-                        "created_at": m.created_at.isoformat(),
-                    }
-                    for m in memories[:limit]
-                ]
-
-            elif name == "delete_memory":
-                deleted = await self._memory.delete_memory(arguments["memory_id"])
-                return {"deleted": deleted}
-
-            elif name == "get_usage_summary":
-                if not self._usage_repo:
-                    return {"error": "Usage tracking not available"}
-                hours = arguments.get("hours", 6)
-                recent = await self._usage_repo.aggregate_recent(hours=hours)
-                totals = await self._usage_repo.aggregate_totals()
-                return {"recent": recent, "totals": totals, "recent_hours": hours}
-
-            elif name == "get_session_git_log":
-                session = await self._session.get_session(arguments["session_id"])
-                if not session:
-                    return {"error": "Session not found"}
-                if not session.worktree_path:
-                    return {"error": "Session has no worktree"}
-                log = await git_ops.get_log(
-                    session.worktree_path,
-                    max_commits=arguments.get("max_commits", 10),
-                )
-                return {"log": log}
-
-            elif name == "list_workspaces":
-                if not self._workspace_repo:
-                    return {"error": "Workspace repo not available"}
-                workspaces = await self._workspace_repo.list_all()
-                return [
-                    {"id": ws.id, "path": ws.path, "name": ws.name}
-                    for ws in workspaces
-                ]
-
-            elif name == "send_notification":
-                if not self._signal:
-                    return {"error": "Signal service not available"}
-                sent = await self._signal.send_notification(
-                    arguments["recipient"], arguments["text"],
-                )
-                return {"sent": sent}
-
-            elif name == "merge_session":
-                session = await self._session.get_session(arguments["session_id"])
-                if not session:
-                    return {"error": "Session not found"}
-                if not session.worktree_path:
-                    return {"error": "Session has no worktree"}
-                # Find the task to get the main workspace path
-                task = await self._task.get_task_by_id(session.task_id)
-                if not task or not task.workspace_path:
-                    return {"error": "Task has no workspace_path — cannot determine merge target"}
-                # Auto-check conflicts unless force=True
-                force = arguments.get("force", False)
-                if not force:
-                    conflict_result = await self._check_session_conflicts_tool(arguments["session_id"])
-                    if conflict_result.get("has_conflicts"):
-                        return {
-                            "merged": False,
-                            "warning": "Conflicting file changes detected. Use force=true to merge anyway.",
-                            "conflicts": conflict_result["conflicts"],
-                        }
-                # Get the branch name from the worktree
-                branch_proc = await asyncio.create_subprocess_exec(
-                    "git", "rev-parse", "--abbrev-ref", "HEAD",
-                    cwd=session.worktree_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await branch_proc.communicate()
-                branch_name = stdout.decode().strip()
-                if not branch_name:
-                    return {"error": "Could not determine session branch name"}
-                result = await git_ops.merge_branch(task.workspace_path, branch_name)
-                # Record merge for rollback support
-                if self._merge_record_repo:
-                    try:
-                        merge_sha = await git_ops.get_head_sha(task.workspace_path)
-                        from agentbenchplatform.models.merge_record import MergeRecord
-                        await self._merge_record_repo.insert(MergeRecord(
-                            session_id=session.id,
-                            task_id=session.task_id,
-                            branch_name=branch_name,
-                            merge_commit_sha=merge_sha,
-                        ))
-                    except Exception:
-                        logger.debug("Failed to record merge", exc_info=True)
-                return {"merged": True, "branch": branch_name, "output": result}
-
-            # --- Phase 3 tool handlers ---
-
-            elif name == "check_session_liveness":
-                alive = await self._session.check_session_liveness(
-                    arguments["session_id"]
-                )
-                return {"alive": alive, "session_id": arguments["session_id"]}
-
-            elif name == "list_events_by_session":
-                if not self._agent_event_repo:
-                    return {"error": "Agent event repo not available"}
-                events = await self._agent_event_repo.list_by_session(
-                    session_id=arguments["session_id"],
-                    limit=arguments.get("limit", 20),
-                )
-                return [
-                    {
-                        "id": e.id,
-                        "session_id": e.session_id,
-                        "event_type": e.event_type.value,
-                        "detail": e.detail,
-                        "acknowledged": e.acknowledged,
-                        "created_at": e.created_at.isoformat(),
-                    }
-                    for e in events
-                ]
-
-            elif name == "list_reports_by_task":
-                if not self._session_report_repo:
-                    return {"error": "Session report repo not available"}
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                reports = await self._session_report_repo.list_by_task(
-                    task_id=task.id,
-                    limit=arguments.get("limit", 10),
-                )
-                return [
-                    {
-                        "session_id": r.session_id,
-                        "agent": r.agent,
-                        "status": r.status,
-                        "summary": r.summary[:200],
-                        "files_changed": list(r.files_changed),
-                        "created_at": r.created_at.isoformat(),
-                    }
-                    for r in reports
-                ]
-
-            elif name == "list_recent_reports":
-                if not self._session_report_repo:
-                    return {"error": "Session report repo not available"}
-                reports = await self._session_report_repo.list_recent(
-                    limit=arguments.get("limit", 10),
-                )
-                return [
-                    {
-                        "session_id": r.session_id,
-                        "task_id": r.task_id,
-                        "agent": r.agent,
-                        "status": r.status,
-                        "summary": r.summary[:200],
-                        "created_at": r.created_at.isoformat(),
-                    }
-                    for r in reports
-                ]
-
-            elif name == "get_memory_by_key":
-                task_id = ""
-                if task_slug := arguments.get("task_slug"):
-                    task = await self._task.get_task(task_slug)
-                    task_id = task.id if task else ""
-                entry = await self._memory.find_by_key(
-                    arguments["key"], task_id=task_id,
-                )
-                if not entry:
-                    return {"error": f"No memory found with key: {arguments['key']}"}
-                return {
-                    "id": entry.id,
-                    "key": entry.key,
-                    "content": entry.content,
-                    "scope": entry.scope.value,
-                    "task_id": entry.task_id,
-                    "session_id": entry.session_id,
-                    "content_type": entry.content_type,
-                    "created_at": entry.created_at.isoformat(),
-                }
-
-            elif name == "update_memory":
-                updated = await self._memory.update_memory(
-                    arguments["memory_id"], arguments["content"],
-                )
-                if not updated:
-                    return {"error": f"Memory not found: {arguments['memory_id']}"}
-                return {"updated": True, "id": updated.id}
-
-            elif name == "list_memories_by_session":
-                memories = await self._memory.list_by_session(
-                    arguments["session_id"],
-                )
-                return [
-                    {
-                        "id": m.id,
-                        "key": m.key,
-                        "content": m.content[:500],
-                        "scope": m.scope.value,
-                        "created_at": m.created_at.isoformat(),
-                    }
-                    for m in memories
-                ]
-
-            elif name == "get_usage_by_task":
-                if not self._usage_repo:
-                    return {"error": "Usage tracking not available"}
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                result = await self._usage_repo.aggregate_by_task(task.id)
-                return result
-
-            elif name == "archive_session":
-                session = await self._session.archive_session(
-                    arguments["session_id"]
-                )
-                if not session:
-                    return {"error": "Session not found"}
-                return {"archived": True, "session_id": session.id}
-
-            elif name == "register_workspace":
-                if not self._workspace_repo:
-                    return {"error": "Workspace repo not available"}
-                from agentbenchplatform.models.workspace import Workspace
-                ws = await self._workspace_repo.insert(Workspace(
-                    path=arguments["path"],
-                    name=arguments.get("name", ""),
-                ))
-                return {"registered": True, "id": ws.id, "path": ws.path}
-
-            elif name == "delete_workspace":
-                if not self._workspace_repo:
-                    return {"error": "Workspace repo not available"}
-                deleted = await self._workspace_repo.delete(arguments["workspace_id"])
-                return {"deleted": deleted}
-
-            elif name == "list_conversations":
-                if not self._history_repo:
-                    return {"error": "History repo not available"}
-                convos = await self._history_repo.list_conversations()
-                for c in convos:
-                    if "updated_at" in c and c["updated_at"] is not None:
-                        c["updated_at"] = c["updated_at"].isoformat()
-                return convos
-
-            elif name == "clear_conversation":
-                if not self._history_repo:
-                    return {"error": "History repo not available"}
-                cleared = await self._history_repo.clear_conversation(
-                    arguments["channel"],
-                    arguments.get("sender_id", ""),
-                )
-                # Also clear in-memory cache
-                key = f"{arguments['channel']}:{arguments.get('sender_id', '')}"
-                self._conversations.pop(key, None)
-                return {"cleared": cleared}
-
-            elif name == "get_research_results":
-                if not self._research:
-                    return {"error": "Research service not available"}
-                task = await self._task.get_task(arguments["task_slug"])
-                if not task:
-                    return {"error": f"Task not found: {arguments['task_slug']}"}
-                results = await self._research.get_research_results(task.id)
-                return [
-                    {
-                        "key": m.key,
-                        "content": m.content[:500],
-                        "created_at": m.created_at.isoformat(),
-                    }
-                    for m in results
-                ]
-
-            # --- Dependency tool handlers ---
-
-            elif name == "add_dependency":
-                task = await self._task.add_dependency(
-                    arguments["task_slug"], arguments["depends_on_slug"],
-                )
-                return {"added": True, "slug": task.slug, "depends_on": list(task.depends_on)}
-
-            elif name == "remove_dependency":
-                task = await self._task.remove_dependency(
-                    arguments["task_slug"], arguments["depends_on_slug"],
-                )
-                return {"removed": True, "slug": task.slug, "depends_on": list(task.depends_on)}
-
-            elif name == "get_task_dependencies":
-                deps = await self._task.get_task_dependencies(arguments["task_slug"])
-                return deps
-
-            elif name == "get_ready_tasks":
-                tasks = await self._task.get_ready_tasks()
-                return [
-                    {
-                        "slug": t.slug,
-                        "title": t.title,
-                        "status": t.status.value,
-                        "depends_on": list(t.depends_on),
-                        "complexity": t.complexity,
-                    }
-                    for t in tasks
-                ]
-
-            # --- Conflict detection tool handler ---
-
-            elif name == "check_conflicts":
-                return await self._check_session_conflicts_tool(arguments["session_id"])
-
-            # --- Rollback tool handler ---
-
-            elif name == "rollback_session":
-                return await self._handle_rollback_session(arguments["session_id"])
-
-            # --- Progress estimation tool handler ---
-
-            elif name == "estimate_duration":
-                return await self._handle_estimate_duration(arguments)
-
-            # --- Playbook tool handlers ---
-
-            elif name == "list_playbooks":
-                return await self._handle_list_playbooks()
-
-            elif name == "create_playbook":
-                return await self._handle_create_playbook(arguments)
-
-            elif name == "run_playbook":
-                return await self._handle_run_playbook(arguments)
-
-            else:
+            handlers = get_tool_handlers()
+            handler = handlers.get(name)
+            if handler is None:
                 return {"error": f"Unknown tool: {name}"}
-
+            return await handler(self._tool_ctx, arguments)
         except KeyError as e:
             logger.warning("Tool %s missing required argument: %s", name, e)
             return {"error": f"Missing required argument: {e}"}
@@ -2117,469 +1557,6 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         except Exception as e:
             logger.exception("Tool %s execution failed unexpectedly", name)
             return {"error": f"Tool execution failed: {str(e)}"}
-
-    # --- Review Session Handler ---
-
-    async def _handle_review_session(self, arguments: dict) -> dict:
-        """Generate a comprehensive session review with diff, tests, and AI summary."""
-        session_id = arguments["session_id"]
-        session = await self._session.get_session(session_id)
-        if not session:
-            return {"error": "Session not found"}
-
-        # 1. Get diff and parse stats
-        try:
-            diff = await self._session.get_session_diff(session_id)
-        except Exception:
-            diff = ""
-        diff_stats = self._parse_diff_stats(diff or "")
-        files_changed = self._parse_files_from_diff(diff or "")
-
-        # 2. Run tests if command provided
-        test_results = None
-        test_output = ""
-        if test_cmd := arguments.get("test_command"):
-            try:
-                test_output = await self._session.run_in_worktree(session_id, test_cmd)
-                test_results = self._parse_test_results(test_output)
-            except Exception as e:
-                test_output = str(e)
-                test_results = TestResults(errors=1, output_snippet=test_output[:500])
-
-        # 3. Run lint if command provided
-        lint_output = ""
-        if lint_cmd := arguments.get("lint_command"):
-            try:
-                lint_output = await self._session.run_in_worktree(session_id, lint_cmd)
-            except Exception as e:
-                lint_output = str(e)
-
-        # 4. Generate AI summary
-        summary = ""
-        try:
-            summary_input = f"Diff stats: {diff_stats.insertions}+ {diff_stats.deletions}- across {diff_stats.files} files"
-            if test_results:
-                summary_input += f"\nTests: {test_results.passed} passed, {test_results.failed} failed, {test_results.errors} errors"
-            if lint_output:
-                summary_input += f"\nLint output: {lint_output[:300]}"
-            if diff:
-                summary_input += f"\nDiff preview:\n{diff[:1000]}"
-
-            summary_config = LLMConfig(
-                model=self._llm_config.model,
-                max_tokens=200,
-                temperature=0.3,
-            )
-            resp = await self._provider.complete(
-                [
-                    LLMMessage(role="system", content="Summarize this session's work in 2 sentences. Focus on what was changed and whether it looks correct."),
-                    LLMMessage(role="user", content=summary_input),
-                ],
-                summary_config,
-            )
-            summary = resp.content
-        except Exception:
-            summary = f"Changed {diff_stats.files} files ({diff_stats.insertions}+ {diff_stats.deletions}-)"
-
-        # 5. Determine status
-        if test_results and test_results.failed > 0:
-            status = "failed"
-        elif test_results and test_results.errors > 0:
-            status = "failed"
-        elif diff_stats.files == 0:
-            status = "partial"
-        else:
-            status = "success"
-
-        # 6. Store report
-        report = SessionReport(
-            session_id=session_id,
-            task_id=session.task_id,
-            agent=session.agent_backend,
-            status=status,
-            summary=summary,
-            files_changed=files_changed,
-            test_results=test_results,
-            diff_stats=diff_stats,
-            agent_notes=lint_output[:500] if lint_output else "",
-        )
-        if self._session_report_repo:
-            try:
-                report = await self._session_report_repo.insert(report)
-            except Exception:
-                logger.warning("Failed to store session report", exc_info=True)
-
-        # Record session metric for progress estimation
-        await self._record_session_metric(session, status)
-
-        result: dict[str, Any] = {
-            "session_id": session_id,
-            "status": status,
-            "summary": summary,
-            "files_changed": list(files_changed),
-            "diff_stats": diff_stats.to_doc(),
-        }
-        if test_results:
-            result["test_results"] = test_results.to_doc()
-
-        # 7. Auto-escalation if failed and agent is junior/mid
-        if status == "failed" and session.agent_backend in ("opencode_local", "opencode"):
-            escalation = await self._auto_escalate(session, summary)
-            if escalation:
-                result["escalation"] = escalation
-
-        # 8. Auto-unblock: check if downstream tasks are now unblocked
-        if status == "success":
-            unblocked = await self._check_auto_unblock(session.task_id)
-            if unblocked:
-                result["unblocked_tasks"] = unblocked
-
-        return result
-
-    async def _auto_escalate(self, session, failure_summary: str) -> dict | None:
-        """Auto-start a higher-tier session when a lower tier fails."""
-        current_tier = _AGENT_TIERS.get(session.agent_backend, 0)
-        if current_tier >= 2:  # Already at highest tier
-            return None
-
-        next_agent = _TIER_ORDER[current_tier + 1]
-
-        # Emit needs_help event
-        await self._emit_event(
-            session.id, session.task_id,
-            AgentEventType.NEEDS_HELP,
-            f"Auto-escalating from {session.agent_backend} to {next_agent}: {failure_summary[:200]}",
-        )
-
-        # Start escalated session
-        try:
-            task = await self._task.get_task_by_id(session.task_id)
-            if not task:
-                return None
-            escalated = await self._session.start_coding_session(
-                task_id=task.id,
-                agent_type=next_agent,
-                prompt=f"Previous {session.agent_backend} session failed. Issue: {failure_summary}\nPlease fix the problems and complete the task.",
-                workspace_path=task.workspace_path,
-                task_tags=task.tags,
-                task_complexity=task.complexity,
-            )
-            await self._emit_event(
-                escalated.id, task.id,
-                AgentEventType.STARTED,
-                f"Escalated from {session.agent_backend}: {next_agent} started",
-            )
-            return {
-                "escalated_to": next_agent,
-                "new_session_id": escalated.id,
-                "reason": failure_summary[:200],
-            }
-        except Exception:
-            logger.warning("Auto-escalation failed", exc_info=True)
-            return None
-
-    # --- Auto Report on Stop ---
-
-    async def _auto_report_on_stop(self, session) -> None:
-        """Generate a basic report when a session is stopped (diff only, no LLM)."""
-        if not self._session_report_repo:
-            return
-        try:
-            # Check if report already exists
-            existing = await self._session_report_repo.find_by_session(session.id)
-            if existing:
-                return
-
-            diff = ""
-            try:
-                diff = await self._session.get_session_diff(session.id)
-            except Exception:
-                pass
-            diff_stats = self._parse_diff_stats(diff or "")
-            files_changed = self._parse_files_from_diff(diff or "")
-
-            report = SessionReport(
-                session_id=session.id,
-                task_id=session.task_id,
-                agent=session.agent_backend,
-                status="partial" if diff_stats.files == 0 else "success",
-                summary=f"Session stopped. {diff_stats.files} files changed ({diff_stats.insertions}+ {diff_stats.deletions}-).",
-                files_changed=files_changed,
-                diff_stats=diff_stats,
-            )
-            await self._session_report_repo.insert(report)
-            # Record session metric
-            await self._record_session_metric(session)
-        except Exception:
-            logger.debug("Failed to auto-generate report on stop", exc_info=True)
-
-    # --- Session Metrics ---
-
-    async def _record_session_metric(self, session, status: str = "success") -> None:
-        """Record a session duration metric for progress estimation."""
-        if not self._session_metric_repo:
-            return
-        try:
-            duration = (datetime.now(timezone.utc) - session.created_at).total_seconds()
-            # Look up task complexity
-            complexity = ""
-            try:
-                task = await self._task.get_task_by_id(session.task_id)
-                if task:
-                    complexity = task.complexity
-            except Exception:
-                pass
-
-            from agentbenchplatform.models.session_metric import SessionMetric
-            await self._session_metric_repo.insert(SessionMetric(
-                session_id=session.id,
-                task_id=session.task_id,
-                agent_backend=session.agent_backend,
-                complexity=complexity,
-                status=status,
-                duration_seconds=int(duration),
-            ))
-        except Exception:
-            logger.debug("Failed to record session metric", exc_info=True)
-
-    # --- Auto-Unblock ---
-
-    async def _check_auto_unblock(self, task_id: str) -> list[str]:
-        """Check if completing a task unblocks downstream tasks."""
-        try:
-            task = await self._task.get_task_by_id(task_id)
-            if not task:
-                return []
-            downstream = await self._task.get_downstream_tasks(task.slug)
-            unblocked: list[str] = []
-            for dt in downstream:
-                if dt.status != TaskStatus.ACTIVE:
-                    continue
-                deps = await self._task.get_task_dependencies(dt.slug)
-                if not deps["blocking"]:
-                    unblocked.append(dt.slug)
-                    await self._emit_event(
-                        "", task_id,
-                        AgentEventType.NEEDS_HELP,
-                        f"Task '{dt.slug}' is now unblocked — all dependencies satisfied",
-                    )
-            return unblocked
-        except Exception:
-            logger.debug("Auto-unblock check failed", exc_info=True)
-            return []
-
-    # --- Conflict Detection ---
-
-    async def _check_session_conflicts_tool(self, session_id: str) -> dict:
-        """Check for file conflicts between sessions on the same task."""
-        session = await self._session.get_session(session_id)
-        if not session:
-            return {"error": "Session not found"}
-        if not session.worktree_path:
-            return {"error": "Session has no worktree"}
-
-        try:
-            my_files = await git_ops.get_branch_changed_files(session.worktree_path)
-        except Exception as e:
-            return {"error": f"Could not get changed files: {e}"}
-
-        # Find other sessions for the same task
-        all_sessions = await self._session.list_sessions(task_id=session.task_id)
-        conflicts: list[dict] = []
-        for other in all_sessions:
-            if other.id == session_id or not other.worktree_path:
-                continue
-            if other.lifecycle not in (SessionLifecycle.RUNNING, SessionLifecycle.STOPPED):
-                continue
-            try:
-                other_files = await git_ops.get_branch_changed_files(other.worktree_path)
-                overlap = set(my_files) & set(other_files)
-                if overlap:
-                    conflicts.append({
-                        "session_id": other.id,
-                        "overlapping_files": sorted(overlap),
-                    })
-            except Exception:
-                continue
-
-        return {"has_conflicts": len(conflicts) > 0, "conflicts": conflicts}
-
-    # --- Rollback Handler ---
-
-    async def _handle_rollback_session(self, session_id: str) -> dict:
-        """Revert a previously merged session."""
-        if not self._merge_record_repo:
-            return {"error": "Merge record repo not available"}
-
-        record = await self._merge_record_repo.find_by_session(session_id)
-        if not record:
-            return {"error": f"No merge record found for session: {session_id}"}
-        if record.reverted:
-            return {"error": "This merge has already been reverted"}
-
-        # Find the task to get workspace path
-        task = await self._task.get_task_by_id(record.task_id)
-        if not task or not task.workspace_path:
-            return {"error": "Task has no workspace_path — cannot revert"}
-
-        try:
-            revert_sha = await git_ops.revert_merge(task.workspace_path, record.merge_commit_sha)
-            await self._merge_record_repo.mark_reverted(session_id, revert_sha)
-            return {"reverted": True, "revert_commit": revert_sha, "session_id": session_id}
-        except Exception as e:
-            return {"error": f"Git revert failed: {e}"}
-
-    # --- Progress Estimation Handler ---
-
-    async def _handle_estimate_duration(self, arguments: dict) -> dict:
-        """Estimate session duration from historical data."""
-        if not self._session_metric_repo:
-            return {"error": "Session metric repo not available"}
-
-        session_id = arguments.get("session_id")
-        if session_id:
-            # Estimate remaining time for a running session
-            session = await self._session.get_session(session_id)
-            if not session:
-                return {"error": "Session not found"}
-            elapsed = (datetime.now(timezone.utc) - session.created_at).total_seconds()
-            stats = await self._session_metric_repo.get_stats(
-                agent=session.agent_backend,
-                complexity=arguments.get("complexity"),
-            )
-            if stats["sample_count"] < 3:
-                return {"insufficient_data": True, "elapsed_seconds": int(elapsed), "sample_count": stats["sample_count"]}
-            remaining = max(0, stats["avg_seconds"] - elapsed)
-            return {
-                "elapsed_seconds": int(elapsed),
-                "estimated_remaining_seconds": int(remaining),
-                "avg_seconds": stats["avg_seconds"],
-                "p90_seconds": stats["p90_seconds"],
-                "sample_count": stats["sample_count"],
-            }
-
-        # General stats
-        stats = await self._session_metric_repo.get_stats(
-            agent=arguments.get("agent"),
-            complexity=arguments.get("complexity"),
-        )
-        if stats["sample_count"] < 3:
-            return {"insufficient_data": True, "sample_count": stats["sample_count"]}
-        return stats
-
-    # --- Playbook Handlers ---
-
-    async def _handle_list_playbooks(self) -> list[dict]:
-        """List all playbooks."""
-        if not self._playbook_repo:
-            return {"error": "Playbook repo not available"}
-        playbooks = await self._playbook_repo.list_all()
-        return [
-            {
-                "name": p.name,
-                "description": p.description,
-                "steps": len(p.steps),
-                "workspace_path": p.workspace_path,
-                "tags": list(p.tags),
-            }
-            for p in playbooks
-        ]
-
-    async def _handle_create_playbook(self, arguments: dict) -> dict:
-        """Create a new playbook."""
-        if not self._playbook_repo:
-            return {"error": "Playbook repo not available"}
-
-        from agentbenchplatform.models.playbook import Playbook, PlaybookStep
-
-        steps = tuple(
-            PlaybookStep(action=s["action"], params=s.get("params", {}))
-            for s in arguments["steps"]
-        )
-        playbook = Playbook(
-            name=arguments["name"],
-            description=arguments.get("description", ""),
-            steps=steps,
-            workspace_path=arguments.get("workspace_path", ""),
-        )
-        saved = await self._playbook_repo.insert(playbook)
-        return {"created": True, "name": saved.name}
-
-    async def _handle_run_playbook(self, arguments: dict) -> dict:
-        """Execute a playbook, creating tasks and sessions."""
-        if not self._playbook_repo:
-            return {"error": "Playbook repo not available"}
-
-        playbook = await self._playbook_repo.find_by_name(arguments["playbook_name"])
-        if not playbook:
-            return {"error": f"Playbook not found: {arguments['playbook_name']}"}
-
-        workspace_path = arguments.get("workspace_path") or playbook.workspace_path
-        dry_run = arguments.get("dry_run", False)
-
-        results: list[dict] = []
-        task_slugs: dict[int, str] = {}  # step_index -> task_slug
-
-        for i, step in enumerate(playbook.steps):
-            if dry_run:
-                results.append({"step": i, "action": step.action, "params": step.params, "dry_run": True})
-                continue
-
-            if step.action == "create_task":
-                deps = ()
-                if dep_step := step.params.get("depends_on_step"):
-                    dep_slug = task_slugs.get(dep_step)
-                    if dep_slug:
-                        deps = (dep_slug,)
-                try:
-                    task = await self._task.create_task(
-                        title=step.params.get("title", f"Playbook step {i}"),
-                        description=step.params.get("description", ""),
-                        workspace_path=step.params.get("workspace_path", workspace_path),
-                        complexity=step.params.get("complexity", ""),
-                        depends_on=deps,
-                    )
-                    task_slugs[i] = task.slug
-                    results.append({"step": i, "action": "create_task", "slug": task.slug})
-                except Exception as e:
-                    results.append({"step": i, "action": "create_task", "error": str(e)})
-
-            elif step.action == "start_session":
-                task_ref = step.params.get("task_ref")
-                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
-                if not task_slug:
-                    results.append({"step": i, "action": "start_session", "error": "Task ref not found"})
-                    continue
-                try:
-                    result = await self._execute_tool("start_coding_session", {
-                        "task_slug": task_slug,
-                        "agent": step.params.get("agent", ""),
-                        "prompt": step.params.get("prompt", ""),
-                    })
-                    results.append({"step": i, "action": "start_session", **result})
-                except Exception as e:
-                    results.append({"step": i, "action": "start_session", "error": str(e)})
-
-            elif step.action == "review_session":
-                task_ref = step.params.get("task_ref")
-                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
-                results.append({
-                    "step": i, "action": "review_session",
-                    "note": "Review will run when session completes",
-                    "task_slug": task_slug,
-                    "test_command": step.params.get("test_command", ""),
-                })
-
-            elif step.action == "merge_session":
-                task_ref = step.params.get("task_ref")
-                task_slug = task_slugs.get(task_ref) if task_ref is not None else None
-                results.append({
-                    "step": i, "action": "merge_session",
-                    "note": "Merge will run after review",
-                    "task_slug": task_slug,
-                })
-
-        return {"playbook": playbook.name, "steps_executed": len(results), "results": results}
 
     # --- Decision Logging ---
 
@@ -2639,83 +1616,6 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         except Exception:
             logger.debug("Failed to emit agent event", exc_info=True)
 
-    # --- Parsing Helpers ---
-
-    @staticmethod
-    def _parse_diff_stats(diff: str) -> DiffStats:
-        """Parse insertions/deletions/files from a git diff."""
-        insertions = 0
-        deletions = 0
-        files = set()
-
-        for line in diff.splitlines():
-            if line.startswith("+++") or line.startswith("---"):
-                # Extract filename
-                parts = line.split("\t", 1)
-                if len(parts) > 1:
-                    files.add(parts[1])
-                elif line.startswith("+++ b/") or line.startswith("--- a/"):
-                    fname = line[6:]
-                    if fname != "/dev/null":
-                        files.add(fname)
-            elif line.startswith("+") and not line.startswith("+++"):
-                insertions += 1
-            elif line.startswith("-") and not line.startswith("---"):
-                deletions += 1
-
-        return DiffStats(
-            insertions=insertions,
-            deletions=deletions,
-            files=len(files),
-        )
-
-    @staticmethod
-    def _parse_files_from_diff(diff: str) -> tuple[str, ...]:
-        """Extract changed file paths from a git diff."""
-        files = []
-        for line in diff.splitlines():
-            if line.startswith("diff --git"):
-                parts = line.split(" b/", 1)
-                if len(parts) > 1:
-                    files.append(parts[1])
-        return tuple(files)
-
-    @staticmethod
-    def _parse_test_results(output: str) -> TestResults:
-        """Parse test results from common test runner output."""
-        passed = 0
-        failed = 0
-        errors = 0
-
-        # pytest pattern: "X passed, Y failed, Z errors"
-        pytest_match = re.search(
-            r"(\d+)\s+passed", output
-        )
-        if pytest_match:
-            passed = int(pytest_match.group(1))
-        fail_match = re.search(r"(\d+)\s+failed", output)
-        if fail_match:
-            failed = int(fail_match.group(1))
-        error_match = re.search(r"(\d+)\s+error", output)
-        if error_match:
-            errors = int(error_match.group(1))
-
-        # npm test / jest pattern
-        if not pytest_match:
-            jest_pass = re.search(r"Tests:\s+(\d+)\s+passed", output)
-            jest_fail = re.search(r"Tests:\s+(\d+)\s+failed", output)
-            if jest_pass:
-                passed = int(jest_pass.group(1))
-            if jest_fail:
-                failed = int(jest_fail.group(1))
-
-        return TestResults(
-            passed=passed,
-            failed=failed,
-            errors=errors,
-            output_snippet=output[-500:] if len(output) > 500 else output,
-        )
-
     # --- Patrol Mode ---
 
     async def _patrol_loop(self) -> None:
@@ -2735,7 +1635,26 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         """Single patrol iteration: gather state, optionally act."""
         autonomy = self._config.coordinator.patrol_autonomy
 
-        # Gather system snapshot
+        if autonomy == "observe":
+            # Lightweight observe mode — only count, no expensive data gathering
+            sessions = await self._session.list_sessions()
+            running_count = sum(
+                1 for s in sessions if s.lifecycle == SessionLifecycle.RUNNING
+            )
+            unacked_count = 0
+            if self._agent_event_repo:
+                try:
+                    events = await self._agent_event_repo.list_unacknowledged(limit=1)
+                    unacked_count = len(events)
+                except Exception:
+                    pass
+            logger.info(
+                "Patrol [observe]: %d running sessions, %d unacked events",
+                running_count, unacked_count,
+            )
+            return
+
+        # Gather system snapshot for nudge/full modes
         snapshot = await self._dashboard.load_snapshot()
         state_text = snapshot.summary_text()
 
@@ -2779,14 +1698,6 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     )
                 except Exception:
                     session_summaries.append(f"  {s.id[:8]}... ({s.agent_backend}): (could not read output)")
-
-        if autonomy == "observe":
-            # Log-only mode — no LLM calls, zero cost
-            logger.info(
-                "Patrol [observe]: %d running sessions, %d unacked events",
-                len(session_summaries), len(unacked_events),
-            )
-            return
 
         # Build patrol prompt for the LLM
         event_text = ""
