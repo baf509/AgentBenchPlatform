@@ -11,6 +11,7 @@ class AgentEventType(str, Enum):
     STARTED = "started"
     OUTPUT = "output"
     STALLED = "stalled"
+    WAITING_INPUT = "waiting_input"
     ERROR = "error"
     COMPLETED = "completed"
     NEEDS_HELP = "needs_help"

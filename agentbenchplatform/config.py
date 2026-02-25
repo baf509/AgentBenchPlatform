@@ -119,6 +119,7 @@ class CoordinatorConfig:
     patrol_interval: int = 300
     patrol_autonomy: str = "observe"  # observe, nudge, full
     patrol_notify_phone: str = ""
+    auto_respond_prompts: bool = True
 
 
 @dataclass
@@ -247,6 +248,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             patrol_interval=coordinator_raw.get("patrol_interval", 300),
             patrol_autonomy=coordinator_raw.get("patrol_autonomy", "observe"),
             patrol_notify_phone=coordinator_raw.get("patrol_notify_phone", ""),
+            auto_respond_prompts=coordinator_raw.get("auto_respond_prompts", True),
         ),
         research=ResearchDefaults(
             default_provider=research_raw.get("default_provider", "anthropic"),

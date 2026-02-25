@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -38,6 +39,41 @@ from agentbenchplatform.services.session_service import SessionService
 from agentbenchplatform.services.task_service import TaskService
 
 logger = logging.getLogger(__name__)
+
+# Patterns that match common interactive prompts agents may encounter.
+# Each tuple: (compiled regex, auto_response or None, human-readable description)
+INTERACTIVE_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
+    # Claude Code permission prompts (safety net if bypassPermissions is off)
+    (re.compile(r"Allow|Deny|allow this|deny this", re.IGNORECASE), "y\n", "permission prompt"),
+    # Generic yes/no confirmations
+    (re.compile(r"\(y/n\)|\(Y/n\)|\[y/N\]|\[Y/n\]"), "y\n", "yes/no confirmation"),
+    # "Do you want to proceed/continue?"
+    (re.compile(r"(?:proceed|continue|overwrite|replace)\?", re.IGNORECASE), "y\n", "proceed confirmation"),
+    # npm/pip install confirmations
+    (re.compile(r"Do you want to install", re.IGNORECASE), "y\n", "install confirmation"),
+    # Git prompts
+    (re.compile(r"Are you sure you want to", re.IGNORECASE), "y\n", "git confirmation"),
+    # Press enter to continue
+    (re.compile(r"[Pp]ress [Ee]nter|press any key|hit enter"), "\n", "press enter prompt"),
+    # OpenCode permission patterns
+    (re.compile(r"approve|reject|Tool requires approval", re.IGNORECASE), "approve\n", "opencode tool approval"),
+]
+
+
+def _detect_interactive_prompt(output: str) -> tuple[str | None, str] | None:
+    """Check if output ends with a known interactive prompt.
+
+    Examines the last 5 non-empty lines for matches.
+    Returns (auto_response, description) if matched, None otherwise.
+    """
+    lines = [ln for ln in output.strip().splitlines() if ln.strip()]
+    tail = lines[-5:] if len(lines) >= 5 else lines
+    for line in reversed(tail):
+        for pattern, auto_response, description in INTERACTIVE_PROMPT_PATTERNS:
+            if pattern.search(line):
+                return (auto_response, description)
+    return None
+
 
 TOOL_DEFINITIONS = [
     {
@@ -772,6 +808,8 @@ class CoordinatorService:
         self._watchdog_task: asyncio.Task | None = None
         self._patrol_task: asyncio.Task | None = None
         self._session_deadlines: dict[str, float] = {}  # session_id -> deadline timestamp
+        # Output change tracking: session_id -> (output_hash, timestamp_of_last_change)
+        self._session_output_hashes: dict[str, tuple[str, float]] = {}
 
     # --- Late Binding ---
 
@@ -782,16 +820,23 @@ class CoordinatorService:
     # --- Watchdog ---
 
     def start_watchdog(
-        self, check_interval: int = 120, stall_threshold: int = 600
+        self, check_interval: int = 30, stall_threshold: int = 600,
+        idle_interval: int = 120,
     ) -> None:
-        """Start background watchdog that monitors session health."""
+        """Start background watchdog that monitors session health.
+
+        Args:
+            check_interval: Seconds between checks when sessions are running.
+            stall_threshold: Seconds of unchanged output before emitting STALLED.
+            idle_interval: Seconds between checks when no sessions are running.
+        """
         if self._watchdog_task is not None:
             return
         self._watchdog_task = asyncio.ensure_future(
-            self._watchdog_loop(check_interval, stall_threshold)
+            self._watchdog_loop(check_interval, stall_threshold, idle_interval)
         )
-        logger.info("Coordinator watchdog started (interval=%ds, stall=%ds)",
-                     check_interval, stall_threshold)
+        logger.info("Coordinator watchdog started (active=%ds, idle=%ds, stall=%ds)",
+                     check_interval, idle_interval, stall_threshold)
         # Start patrol if configured
         if self._config.coordinator.patrol_enabled and self._patrol_task is None:
             self._patrol_task = asyncio.ensure_future(self._patrol_loop())
@@ -813,12 +858,18 @@ class CoordinatorService:
             logger.info("Coordinator patrol stopped")
 
     async def _watchdog_loop(
-        self, check_interval: int, stall_threshold: int
+        self, check_interval: int, stall_threshold: int, idle_interval: int
     ) -> None:
-        """Periodically check session health and deadlines."""
+        """Periodically check session health and deadlines.
+
+        Uses *check_interval* (fast) when sessions are running,
+        *idle_interval* (slow) when none are active.
+        """
         try:
             while True:
-                await asyncio.sleep(check_interval)
+                has_running = await self._has_running_sessions()
+                interval = check_interval if has_running else idle_interval
+                await asyncio.sleep(interval)
                 try:
                     await self._check_sessions(stall_threshold)
                     await self._check_deadlines()
@@ -827,12 +878,19 @@ class CoordinatorService:
         except asyncio.CancelledError:
             pass
 
-    async def _check_sessions(self, stall_threshold: int) -> None:
-        """Check running sessions for dead processes and stalls."""
+    async def _has_running_sessions(self) -> bool:
+        """Return True if any sessions are currently RUNNING."""
         sessions = await self._session.list_sessions()
+        return any(s.lifecycle == SessionLifecycle.RUNNING for s in sessions)
+
+    async def _check_sessions(self, stall_threshold: int) -> None:
+        """Check running sessions for dead processes, stalls, and interactive prompts."""
+        sessions = await self._session.list_sessions()
+        running_ids = set()
         for session in sessions:
             if session.lifecycle != SessionLifecycle.RUNNING:
                 continue
+            running_ids.add(session.id)
             try:
                 is_alive = await self._session.check_session_liveness(session.id)
                 if not is_alive:
@@ -843,17 +901,87 @@ class CoordinatorService:
                     )
                     continue
 
-                # Check for stalls by looking at recent output
-                output = await self._session.get_session_output(session.id, lines=5)
+                # Capture more context (15 lines) for smarter detection
+                output = await self._session.get_session_output(session.id, lines=15)
+                now = time.time()
+
                 if not output or not output.strip():
-                    # No output at all — could be stalled
+                    # No output at all — check if unchanged long enough
+                    prev = self._session_output_hashes.get(session.id)
+                    if prev is None:
+                        self._session_output_hashes[session.id] = ("", now)
+                    elif now - prev[1] >= stall_threshold:
+                        await self._emit_event(
+                            session.id, session.task_id,
+                            AgentEventType.STALLED,
+                            f"No output detected (unchanged for {int(now - prev[1])}s)",
+                        )
+                    continue
+
+                # Hash output and compare to previous
+                output_hash = hashlib.md5(output.encode(), usedforsecurity=False).hexdigest()
+                prev = self._session_output_hashes.get(session.id)
+
+                if prev is None or prev[0] != output_hash:
+                    # Output changed — update tracking
+                    self._session_output_hashes[session.id] = (output_hash, now)
+                    continue
+
+                # Output unchanged — check how long
+                unchanged_seconds = now - prev[1]
+
+                # Check for interactive prompt patterns
+                prompt_match = _detect_interactive_prompt(output)
+                if prompt_match and unchanged_seconds >= 10:
+                    auto_response, description = prompt_match
+                    auto_responded = False
+
+                    # Auto-respond if configured and autonomy allows
+                    if (
+                        auto_response
+                        and self._config.coordinator.auto_respond_prompts
+                        and self._config.coordinator.patrol_autonomy in ("nudge", "full")
+                    ):
+                        try:
+                            await self._session.send_to_session(session.id, auto_response)
+                            auto_responded = True
+                            logger.info(
+                                "Watchdog auto-responded to %s in session %s (response=%r)",
+                                description, session.id[:8], auto_response.strip(),
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to auto-respond to session %s",
+                                session.id, exc_info=True,
+                            )
+
+                    detail = f"Waiting for input: {description} (unchanged {int(unchanged_seconds)}s)"
+                    if auto_responded:
+                        detail += " [auto-responded]"
+                    await self._emit_event(
+                        session.id, session.task_id,
+                        AgentEventType.WAITING_INPUT,
+                        detail,
+                    )
+                    # Reset hash so we don't re-fire every cycle
+                    self._session_output_hashes[session.id] = (output_hash, now)
+
+                elif unchanged_seconds >= stall_threshold:
                     await self._emit_event(
                         session.id, session.task_id,
                         AgentEventType.STALLED,
-                        f"No output detected (threshold={stall_threshold}s)",
+                        f"Output unchanged for {int(unchanged_seconds)}s",
                     )
+                    # Reset to avoid spamming
+                    self._session_output_hashes[session.id] = (output_hash, now)
+
             except Exception:
                 logger.debug("Watchdog check failed for session %s", session.id, exc_info=True)
+
+        # Clean up hashes for sessions that are no longer running
+        stale = set(self._session_output_hashes) - running_ids
+        for sid in stale:
+            del self._session_output_hashes[sid]
 
     async def _check_deadlines(self) -> None:
         """Stop sessions that have exceeded their deadline."""
@@ -2619,15 +2747,36 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             except Exception:
                 pass
 
-        # Gather running session outputs (brief)
+        # Gather running session outputs (richer context)
         session_summaries: list[str] = []
         sessions = await self._session.list_sessions()
+        now = time.time()
         for s in sessions:
             if s.lifecycle == SessionLifecycle.RUNNING:
                 try:
-                    output = await self._session.get_session_output(s.id, lines=5)
-                    last_line = (output or "").strip().splitlines()[-1] if output else "(no output)"
-                    session_summaries.append(f"  {s.id[:8]}... ({s.agent_backend}): {last_line[:100]}")
+                    output = await self._session.get_session_output(s.id, lines=20)
+                    tail = (output or "").strip().splitlines()[-5:] if output else []
+                    tail_text = "\n".join(f"    | {ln[:120]}" for ln in tail) if tail else "    (no output)"
+
+                    # Determine output change status
+                    prev = self._session_output_hashes.get(s.id)
+                    if prev:
+                        unchanged_secs = int(now - prev[1])
+                        if unchanged_secs > 60:
+                            status = f"unchanged for {unchanged_secs // 60}m{unchanged_secs % 60}s"
+                        else:
+                            status = "active"
+                    else:
+                        status = "active"
+
+                    # Check for interactive prompt
+                    prompt_match = _detect_interactive_prompt(output or "")
+                    if prompt_match:
+                        status = f"WAITING FOR INPUT: {prompt_match[1]}"
+
+                    session_summaries.append(
+                        f"  {s.id[:8]}... ({s.agent_backend}) [{status}]:\n{tail_text}"
+                    )
                 except Exception:
                     session_summaries.append(f"  {s.id[:8]}... ({s.agent_backend}): (could not read output)")
 
@@ -2669,6 +2818,10 @@ Rules:
 - Only act if something clearly needs attention (stalls, errors, help requests)
 - In nudge mode: you can only send messages to sessions and acknowledge events
 - In full mode: you can start/stop sessions, send notifications, and escalate
+- If a session is waiting for interactive input (permission prompt, confirmation, etc.),
+  use send_to_session to approve/proceed. Agents run in isolated worktrees so it's safe.
+- If a session appears stuck in a loop (same error repeated), consider stopping and
+  escalating to a higher-tier agent.
 - Be conservative — prefer observing over acting
 - Keep responses very brief (under 100 words)"""
 
