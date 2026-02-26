@@ -864,6 +864,13 @@ class CoordinatorService:
         self._signal = signal_service
         self._tool_ctx.signal = signal_service
 
+    # --- Public Helpers ---
+
+    async def auto_report(self, session) -> None:
+        """Generate an automatic report for a session (diff-based, no LLM)."""
+        from agentbenchplatform.services.coordinator_tools.report_tools import auto_report_on_stop
+        await auto_report_on_stop(self._tool_ctx, session)
+
     # --- Watchdog ---
 
     def start_watchdog(
@@ -941,11 +948,30 @@ class CoordinatorService:
             try:
                 is_alive = await self._session.check_session_liveness(session.id)
                 if not is_alive:
+                    logger.info(
+                        "Watchdog: session %s process exited, auto-stopping",
+                        session.id[:8],
+                    )
+                    try:
+                        await self.auto_report(session)
+                    except Exception:
+                        logger.warning(
+                            "Failed to generate report for dead session %s",
+                            session.id[:8], exc_info=True,
+                        )
+                    await self._session.stop_session(session.id)
                     await self._emit_event(
                         session.id, session.task_id,
-                        AgentEventType.ERROR,
-                        "Session process is no longer running",
+                        AgentEventType.COMPLETED,
+                        "Session process exited",
                     )
+                    # Clean up notification cooldowns for this session
+                    stale_keys = [
+                        k for k in self._notification_cooldowns
+                        if k.startswith(session.id)
+                    ]
+                    for k in stale_keys:
+                        del self._notification_cooldowns[k]
                     continue
 
                 # Capture more context (15 lines) for smarter detection

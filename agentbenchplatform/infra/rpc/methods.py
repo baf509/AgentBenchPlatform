@@ -233,8 +233,19 @@ class MethodRegistry:
         return serialize_session(session)
 
     async def _session_stop(self, params: dict) -> dict | None:
-        session = await self._ctx.session_service.stop_session(params["session_id"])
-        return serialize_session(session) if session else None
+        session_id = params["session_id"]
+        # Fetch session before stopping so we have metadata for the report
+        session = await self._ctx.session_service.get_session(session_id)
+        stopped = await self._ctx.session_service.stop_session(session_id)
+        if stopped and session:
+            try:
+                await self._ctx.coordinator_service.auto_report(session)
+            except Exception:
+                logger.warning(
+                    "Failed to generate report on session stop %s",
+                    session_id[:8], exc_info=True,
+                )
+        return serialize_session(stopped) if stopped else None
 
     async def _session_pause(self, params: dict) -> dict | None:
         session = await self._ctx.session_service.pause_session(params["session_id"])
