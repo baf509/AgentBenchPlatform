@@ -830,8 +830,8 @@ class CoordinatorService:
         self._summary_failures: dict[str, int] = {}
         # Proactive Signal notification tracking
         self._last_signal_sender: str = ""
-        # session_id -> timestamp of last STALLED notification (rate-limit)
-        self._stall_notification_ts: dict[str, float] = {}
+        # "session_id:event_type" -> monotonic timestamp of last notification
+        self._notification_cooldowns: dict[str, float] = {}
 
         # Build tool context for handler dispatch
         self._tool_ctx = ToolContext(
@@ -1632,8 +1632,8 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         ):
             await self._maybe_notify_phone(session_id, event_type, detail)
 
-    # Stall notification cooldown: max once per 5 minutes per session
-    _STALL_COOLDOWN = 300
+    # Notification cooldown: max once per 5 minutes per (session, event_type)
+    _NOTIFICATION_COOLDOWN = 300
 
     async def _maybe_notify_phone(
         self,
@@ -1653,12 +1653,12 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         if not phone:
             return
 
-        # Rate-limit STALLED notifications (once per 5 min per session)
-        if event_type == AgentEventType.STALLED:
-            last_ts = self._stall_notification_ts.get(session_id, 0.0)
-            if time.monotonic() - last_ts < self._STALL_COOLDOWN:
-                return
-            self._stall_notification_ts[session_id] = time.monotonic()
+        # Rate-limit repeated notifications (once per 5 min per session+type)
+        cooldown_key = f"{session_id}:{event_type.value}"
+        last_ts = self._notification_cooldowns.get(cooldown_key, 0.0)
+        if time.monotonic() - last_ts < self._NOTIFICATION_COOLDOWN:
+            return
+        self._notification_cooldowns[cooldown_key] = time.monotonic()
 
         # Build concise message
         label = event_type.value.upper()
