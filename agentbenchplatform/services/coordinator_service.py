@@ -828,6 +828,10 @@ class CoordinatorService:
         self._session_output_hashes: dict[str, tuple[str, float]] = {}
         # Track consecutive summarization failures per conversation key
         self._summary_failures: dict[str, int] = {}
+        # Proactive Signal notification tracking
+        self._last_signal_sender: str = ""
+        # session_id -> timestamp of last STALLED notification (rate-limit)
+        self._stall_notification_ts: dict[str, float] = {}
 
         # Build tool context for handler dispatch
         self._tool_ctx = ToolContext(
@@ -1258,6 +1262,10 @@ class CoordinatorService:
                 display strings like "Using tool: list_tasks..." and intermediate
                 coordinator text.
         """
+        # Track most recent Signal sender for proactive notifications
+        if channel == "signal" and sender_id:
+            self._last_signal_sender = sender_id
+
         conversation = await self._get_conversation(channel, sender_id)
         key = f"{channel}:{sender_id}"
 
@@ -1601,7 +1609,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         event_type: AgentEventType,
         detail: str,
     ) -> None:
-        """Emit an agent event to MongoDB."""
+        """Emit an agent event to MongoDB and send proactive Signal notifications."""
         if not self._agent_event_repo:
             return
         try:
@@ -1615,6 +1623,60 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             )
         except Exception:
             logger.debug("Failed to emit agent event", exc_info=True)
+
+        # Proactive Signal notification for important events
+        if event_type in (
+            AgentEventType.COMPLETED,
+            AgentEventType.ERROR,
+            AgentEventType.STALLED,
+        ):
+            await self._maybe_notify_phone(session_id, event_type, detail)
+
+    # Stall notification cooldown: max once per 5 minutes per session
+    _STALL_COOLDOWN = 300
+
+    async def _maybe_notify_phone(
+        self,
+        session_id: str,
+        event_type: AgentEventType,
+        detail: str,
+    ) -> None:
+        """Send a proactive Signal notification if we have a phone number."""
+        if not self._signal:
+            return
+
+        # Resolve phone: explicit config > last Signal sender
+        phone = (
+            self._config.coordinator.patrol_notify_phone
+            or self._last_signal_sender
+        )
+        if not phone:
+            return
+
+        # Rate-limit STALLED notifications (once per 5 min per session)
+        if event_type == AgentEventType.STALLED:
+            last_ts = self._stall_notification_ts.get(session_id, 0.0)
+            if time.monotonic() - last_ts < self._STALL_COOLDOWN:
+                return
+            self._stall_notification_ts[session_id] = time.monotonic()
+
+        # Build concise message
+        label = event_type.value.upper()
+        short_id = session_id[:12]
+        # Truncate detail to keep SMS-friendly
+        truncated = (detail[:120] + "...") if len(detail) > 120 else detail
+        text = f"[{short_id}] {label}: {truncated}"
+
+        try:
+            await self._signal.send_notification(phone, text)
+            logger.info(
+                "Sent proactive notification for %s (%s) to %s",
+                session_id, label, phone,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to send proactive notification", exc_info=True,
+            )
 
     # --- Patrol Mode ---
 
