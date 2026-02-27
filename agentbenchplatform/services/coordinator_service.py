@@ -989,6 +989,8 @@ class CoordinatorService:
                             AgentEventType.STALLED,
                             f"No output detected (unchanged for {int(now - prev[1])}s)",
                         )
+                        # Reset to avoid spamming
+                        self._session_output_hashes[session.id] = ("", now)
                     continue
 
                 # Hash output and compare to previous
