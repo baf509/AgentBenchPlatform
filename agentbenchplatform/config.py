@@ -78,7 +78,7 @@ http_url = "http://127.0.0.1:8080"
 auto_start = true
 dm_policy = "allowlist"
 allowed_senders = []
-whisper_url = "http://localhost:8081"
+whisper_url = "http://localhost:8082"
 
 [tmux]
 enabled = true
