@@ -74,14 +74,25 @@ def get_provider_with_fallback(config: AppConfig, primary: str = "") -> LLMProvi
     """
     primary = primary or config.coordinator.provider
 
-    # Determine order: primary first, then the rest
-    all_types = [ProviderType.ANTHROPIC, ProviderType.OPENROUTER, ProviderType.LLAMACPP]
+    # Build ordered list: primary first, then explicit provider_order only.
+    # Do NOT auto-add all providers — some (e.g. anthropic) may be reserved
+    # for other uses (like Claude Code agents).
     try:
         primary_type = ProviderType(primary)
     except ValueError:
-        primary_type = ProviderType.ANTHROPIC
+        primary_type = ProviderType.OPENROUTER
 
-    ordered = [primary_type] + [t for t in all_types if t != primary_type]
+    fallback_names = config.coordinator.provider_order or []
+    fallback_types = []
+    for name in fallback_names:
+        try:
+            pt = ProviderType(name.lower())
+            if pt != primary_type:
+                fallback_types.append(pt)
+        except ValueError:
+            logger.warning("Unknown provider in provider_order: %s", name)
+
+    ordered = [primary_type] + fallback_types
 
     # Build providers, skipping ones without credentials
     providers = []
