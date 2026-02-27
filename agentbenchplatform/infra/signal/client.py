@@ -72,17 +72,18 @@ class SignalClient:
                 continue
 
             text = data_msg.get("message", "")
-            if not text:
+            attachments = data_msg.get("attachments")
+            if not text and not attachments:
                 continue
 
             sender = envelope.get("sourceNumber") or envelope.get("source", "")
-            logger.info("Received message from %s: %s", sender, text[:100])
+            logger.info("Received message from %s: %s", sender, (text or "[attachment]")[:100])
             yield SignalMessage(
                 sender=sender,
                 text=text,
                 timestamp=data_msg.get("timestamp", 0),
                 group_id=data_msg.get("groupInfo", {}).get("groupId", ""),
-                attachments=data_msg.get("attachments"),
+                attachments=attachments,
             )
 
     async def send_message(self, recipient: str, text: str) -> bool:

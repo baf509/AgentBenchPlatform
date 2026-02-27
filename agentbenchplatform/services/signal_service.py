@@ -9,6 +9,7 @@ from agentbenchplatform.config import SignalConfig
 from agentbenchplatform.infra.signal.client import SignalClient
 from agentbenchplatform.infra.signal.daemon import SignalDaemon
 from agentbenchplatform.infra.signal.handler import SignalMessageHandler
+from agentbenchplatform.infra.whisper_client import WhisperClient
 from agentbenchplatform.services.coordinator_service import CoordinatorService
 
 logger = logging.getLogger(__name__)
@@ -33,10 +34,12 @@ class SignalService:
             account=config.account,
             daemon=self._daemon,
         )
+        self._whisper = WhisperClient(base_url=config.whisper_url)
         self._handler = SignalMessageHandler(
             coordinator=coordinator,
             allowed_senders=config.allowed_senders,
             dm_policy=config.dm_policy,
+            whisper_client=self._whisper,
         )
         self._listen_task: asyncio.Task | None = None
 

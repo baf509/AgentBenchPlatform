@@ -78,6 +78,7 @@ http_url = "http://127.0.0.1:8080"
 auto_start = true
 dm_policy = "allowlist"
 allowed_senders = []
+whisper_url = "http://localhost:8081"
 
 [tmux]
 enabled = true
@@ -138,6 +139,7 @@ class SignalConfig:
     auto_start: bool = True
     dm_policy: str = "allowlist"
     allowed_senders: list[str] = field(default_factory=list)
+    whisper_url: str = "http://localhost:8081"
 
 
 @dataclass
@@ -264,6 +266,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             auto_start=signal_raw.get("auto_start", True),
             dm_policy=signal_raw.get("dm_policy", "allowlist"),
             allowed_senders=signal_raw.get("allowed_senders", []),
+            whisper_url=signal_raw.get("whisper_url", "http://localhost:8081"),
         ),
         tmux=TmuxConfig(
             enabled=tmux_raw.get("enabled", True),
