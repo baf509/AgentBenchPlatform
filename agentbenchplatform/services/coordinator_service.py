@@ -1741,13 +1741,23 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             AgentEventType.ERROR,
             AgentEventType.STALLED,
         ):
-            await self._maybe_notify_phone(session_id, event_type, detail)
+            output_snippet = ""
+            if event_type == AgentEventType.STALLED and session_id:
+                try:
+                    raw = await self._session.get_session_output(session_id, lines=5)
+                    if raw:
+                        output_snippet = raw.strip()
+                except Exception:
+                    logger.debug("Failed to capture output for STALLED notification", exc_info=True)
+            await self._maybe_notify_phone(session_id, event_type, detail, output_snippet=output_snippet)
 
     async def _maybe_notify_phone(
         self,
         session_id: str,
         event_type: AgentEventType,
         detail: str,
+        *,
+        output_snippet: str = "",
     ) -> None:
         """Send a proactive Signal notification if we have a phone number."""
         if not self._signal:
@@ -1776,6 +1786,14 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         # Truncate detail to keep SMS-friendly
         truncated = (detail[:120] + "...") if len(detail) > 120 else detail
         text = f"[{short_id}] {label}: {truncated}"
+
+        # Append last output lines for STALLED events
+        if output_snippet:
+            lines = [ln for ln in output_snippet.splitlines() if ln.strip()]
+            tail = lines[-3:]
+            if tail:
+                formatted = "\n".join(f"  | {ln[:80]}" for ln in tail)
+                text += f"\nLast output:\n{formatted}"
 
         try:
             await self._signal.send_notification(phone, text)
@@ -1932,24 +1950,46 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         # Restrict available tools based on autonomy level
         if autonomy == "nudge":
             allowed_tools = {"send_to_session", "acknowledge_events", "list_agent_events",
-                             "get_session_output", "list_tasks", "list_sessions"}
+                             "get_session_output", "list_tasks", "list_sessions",
+                             "send_notification"}
         else:  # full
             allowed_tools = {t["name"] for t in TOOL_DEFINITIONS}
+
+        # Resolve phone for patrol context
+        patrol_phone = (
+            self._config.coordinator.patrol_notify_phone
+            or self._last_signal_sender
+        )
+        phone_context = f"\nNotification phone: {patrol_phone}" if patrol_phone else ""
+
+        # Check if there are STALLED events among unacked
+        has_stalled = any(e.event_type == AgentEventType.STALLED for e in unacked_events)
+        stalled_guidance = ""
+        if has_stalled:
+            stalled_guidance = """
+- IMPORTANT: There are STALLED events. Investigate each stalled session by examining its
+  output (already shown above, or use get_session_output for more detail). Then send a
+  notification with your assessment: explain what the session appears to be doing and
+  suggest an action. Examples:
+  "Session abc123 appears stuck retrying a failed API call — consider stopping it"
+  "Session abc123 is waiting for a large LLM response — likely not actually stalled"
+  "Session abc123 hit a build error and is looping — may need manual intervention"
+"""
 
         patrol_prompt = f"""You are running in autonomous patrol mode (autonomy={autonomy}).
 Survey the system and take appropriate action if needed.
 
 System State:
-{state_text}{event_text}{session_text}
+{state_text}{event_text}{session_text}{phone_context}
 
 Rules:
 - Only act if something clearly needs attention (stalls, errors, help requests)
-- In nudge mode: you can only send messages to sessions and acknowledge events
+- In nudge mode: you can send messages to sessions, acknowledge events, and send notifications
 - In full mode: you can start/stop sessions, send notifications, and escalate
 - If a session is waiting for interactive input (permission prompt, confirmation, etc.),
   use send_to_session to approve/proceed. Agents run in isolated worktrees so it's safe.
 - If a session appears stuck in a loop (same error repeated), consider stopping and
-  escalating to a higher-tier agent.
+  escalating to a higher-tier agent.{stalled_guidance}
 - Be conservative — prefer observing over acting
 - Keep responses very brief (under 100 words)"""
 
