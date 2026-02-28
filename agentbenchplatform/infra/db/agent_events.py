@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 
@@ -33,6 +34,21 @@ class AgentEventRepo:
             acknowledged=event.acknowledged,
             created_at=event.created_at,
         )
+
+    async def has_recent_unacked(
+        self, session_id: str, event_type: str, within_seconds: int = 600,
+    ) -> bool:
+        """Check if an unacknowledged event of this type exists for the session
+        within the given time window. Used to prevent duplicate STALLED/WAITING
+        events from being inserted."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
+        count = await self._col.count_documents({
+            "session_id": session_id,
+            "event_type": event_type,
+            "acknowledged": False,
+            "created_at": {"$gte": cutoff},
+        })
+        return count > 0
 
     async def list_by_session(
         self, session_id: str, limit: int = 50

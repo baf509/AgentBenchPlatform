@@ -121,6 +121,12 @@ class CoordinatorConfig:
     patrol_autonomy: str = "observe"  # observe, nudge, full
     patrol_notify_phone: str = ""
     auto_respond_prompts: bool = True
+    watchdog_check_interval: int = 30
+    watchdog_stall_threshold: int = 600
+    watchdog_idle_interval: int = 120
+    max_conversation_exchanges: int = 20
+    max_tool_rounds: int = 10
+    notification_cooldown: int = 300
 
 
 @dataclass
@@ -251,6 +257,12 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             patrol_autonomy=coordinator_raw.get("patrol_autonomy", "observe"),
             patrol_notify_phone=coordinator_raw.get("patrol_notify_phone", ""),
             auto_respond_prompts=coordinator_raw.get("auto_respond_prompts", True),
+            watchdog_check_interval=coordinator_raw.get("watchdog_check_interval", 30),
+            watchdog_stall_threshold=coordinator_raw.get("watchdog_stall_threshold", 600),
+            watchdog_idle_interval=coordinator_raw.get("watchdog_idle_interval", 120),
+            max_conversation_exchanges=coordinator_raw.get("max_conversation_exchanges", 20),
+            max_tool_rounds=coordinator_raw.get("max_tool_rounds", 10),
+            notification_cooldown=coordinator_raw.get("notification_cooldown", 300),
         ),
         research=ResearchDefaults(
             default_provider=research_raw.get("default_provider", "anthropic"),

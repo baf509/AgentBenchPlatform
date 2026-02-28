@@ -832,6 +832,13 @@ class CoordinatorService:
         self._last_signal_sender: str = ""
         # "session_id:event_type" -> monotonic timestamp of last notification
         self._notification_cooldowns: dict[str, float] = {}
+        # Lock protecting mutable shared state (_conversations, _session_output_hashes,
+        # _session_deadlines, _notification_cooldowns, _summary_failures, etc.)
+        self._state_lock = asyncio.Lock()
+        # Track last access time per conversation key for stale cleanup
+        self._conversation_last_used: dict[str, float] = {}
+        # Watchdog iteration counter for periodic cleanup
+        self._watchdog_iteration: int = 0
 
         # Build tool context for handler dispatch
         self._tool_ctx = ToolContext(
@@ -874,23 +881,23 @@ class CoordinatorService:
     # --- Watchdog ---
 
     def start_watchdog(
-        self, check_interval: int = 30, stall_threshold: int = 600,
-        idle_interval: int = 120,
+        self, check_interval: int | None = None, stall_threshold: int | None = None,
+        idle_interval: int | None = None,
     ) -> None:
         """Start background watchdog that monitors session health.
 
-        Args:
-            check_interval: Seconds between checks when sessions are running.
-            stall_threshold: Seconds of unchanged output before emitting STALLED.
-            idle_interval: Seconds between checks when no sessions are running.
+        Args default to coordinator config values if not provided.
         """
         if self._watchdog_task is not None:
             return
+        ci = check_interval if check_interval is not None else self._config.coordinator.watchdog_check_interval
+        st = stall_threshold if stall_threshold is not None else self._config.coordinator.watchdog_stall_threshold
+        ii = idle_interval if idle_interval is not None else self._config.coordinator.watchdog_idle_interval
         self._watchdog_task = asyncio.ensure_future(
-            self._watchdog_loop(check_interval, stall_threshold, idle_interval)
+            self._watchdog_loop(ci, st, ii)
         )
         logger.info("Coordinator watchdog started (active=%ds, idle=%ds, stall=%ds)",
-                     check_interval, idle_interval, stall_threshold)
+                     ci, ii, st)
         # Start patrol if configured
         if self._config.coordinator.patrol_enabled and self._patrol_task is None:
             self._patrol_task = asyncio.ensure_future(self._patrol_loop())
@@ -929,6 +936,13 @@ class CoordinatorService:
                     await self._check_deadlines()
                 except Exception:
                     logger.warning("Watchdog check failed", exc_info=True)
+                # Periodic cleanup every ~10 iterations
+                self._watchdog_iteration += 1
+                if self._watchdog_iteration % 10 == 0:
+                    try:
+                        await self._cleanup_stale_state()
+                    except Exception:
+                        logger.warning("Stale state cleanup failed", exc_info=True)
         except asyncio.CancelledError:
             pass
 
@@ -938,7 +952,14 @@ class CoordinatorService:
         return any(s.lifecycle == SessionLifecycle.RUNNING for s in sessions)
 
     async def _check_sessions(self, stall_threshold: int) -> None:
-        """Check running sessions for dead processes, stalls, and interactive prompts."""
+        """Check running sessions for dead processes, stalls, and interactive prompts.
+
+        All hash state reads/writes and the decision to emit an event are
+        performed atomically under ``_state_lock`` so that concurrent
+        watchdog/patrol iterations cannot double-fire STALLED events.
+        Timestamps use ``time.monotonic()`` consistently to avoid
+        wall-clock drift issues.
+        """
         sessions = await self._session.list_sessions()
         running_ids = set()
         for session in sessions:
@@ -966,107 +987,124 @@ class CoordinatorService:
                         "Session process exited",
                     )
                     # Clean up notification cooldowns for this session
-                    stale_keys = [
-                        k for k in self._notification_cooldowns
-                        if k.startswith(session.id)
-                    ]
-                    for k in stale_keys:
-                        del self._notification_cooldowns[k]
+                    async with self._state_lock:
+                        stale_keys = [
+                            k for k in self._notification_cooldowns
+                            if k.startswith(session.id)
+                        ]
+                        for k in stale_keys:
+                            del self._notification_cooldowns[k]
                     continue
 
                 # Capture more context (15 lines) for smarter detection
                 output = await self._session.get_session_output(session.id, lines=15)
-                now = time.time()
+                now = time.monotonic()
 
                 if not output or not output.strip():
-                    # No output at all — check if unchanged long enough
-                    prev = self._session_output_hashes.get(session.id)
-                    if prev is None:
-                        self._session_output_hashes[session.id] = ("", now)
-                    elif now - prev[1] >= stall_threshold:
+                    # No output at all — check if unchanged long enough.
+                    # Decide whether to emit under the lock, then emit after.
+                    event_detail: str | None = None
+                    async with self._state_lock:
+                        prev = self._session_output_hashes.get(session.id)
+                        if prev is None:
+                            self._session_output_hashes[session.id] = ("", now)
+                        elif now - prev[1] >= stall_threshold:
+                            event_detail = f"No output detected (unchanged for {int(now - prev[1])}s)"
+                            # Reset timestamp BEFORE emitting to prevent re-fire
+                            self._session_output_hashes[session.id] = ("", now)
+                    if event_detail:
                         await self._emit_event(
                             session.id, session.task_id,
                             AgentEventType.STALLED,
-                            f"No output detected (unchanged for {int(now - prev[1])}s)",
+                            event_detail,
                         )
-                        # Reset to avoid spamming
-                        self._session_output_hashes[session.id] = ("", now)
                     continue
 
-                # Hash output and compare to previous
+                # Hash output and compare to previous.
+                # All state decisions happen inside one lock acquisition.
                 output_hash = hashlib.md5(output.encode(), usedforsecurity=False).hexdigest()
-                prev = self._session_output_hashes.get(session.id)
+                event_to_emit: tuple[AgentEventType, str] | None = None
+                auto_respond_info: tuple[str, str] | None = None  # (response, description)
 
-                if prev is None or prev[0] != output_hash:
-                    # Output changed — update tracking
-                    self._session_output_hashes[session.id] = (output_hash, now)
-                    continue
+                async with self._state_lock:
+                    prev = self._session_output_hashes.get(session.id)
 
-                # Output unchanged — check how long
-                unchanged_seconds = now - prev[1]
+                    if prev is None or prev[0] != output_hash:
+                        # Output changed — update tracking, nothing to emit
+                        self._session_output_hashes[session.id] = (output_hash, now)
+                        continue
 
-                # Check for interactive prompt patterns
-                prompt_match = _detect_interactive_prompt(output)
-                if prompt_match and unchanged_seconds >= 10:
-                    auto_response, description = prompt_match
-                    auto_responded = False
+                    # Output unchanged — check how long
+                    unchanged_seconds = now - prev[1]
 
-                    # Auto-respond if configured and autonomy allows
-                    if (
-                        auto_response
-                        and self._config.coordinator.auto_respond_prompts
-                        and self._config.coordinator.patrol_autonomy in ("nudge", "full")
-                    ):
-                        try:
-                            await self._session.send_to_session(session.id, auto_response)
-                            auto_responded = True
-                            logger.info(
-                                "Watchdog auto-responded to %s in session %s (response=%r)",
-                                description, session.id[:8], auto_response.strip(),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to auto-respond to session %s",
-                                session.id, exc_info=True,
-                            )
+                    # Check for interactive prompt patterns
+                    prompt_match = _detect_interactive_prompt(output)
+                    if prompt_match and unchanged_seconds >= 10:
+                        auto_response, description = prompt_match
+                        if (
+                            auto_response
+                            and self._config.coordinator.auto_respond_prompts
+                            and self._config.coordinator.patrol_autonomy in ("nudge", "full")
+                        ):
+                            auto_respond_info = (auto_response, description)
+                        detail = f"Waiting for input: {description} (unchanged {int(unchanged_seconds)}s)"
+                        event_to_emit = (AgentEventType.WAITING_INPUT, detail)
+                        # Reset BEFORE emitting
+                        self._session_output_hashes[session.id] = (output_hash, now)
 
-                    detail = f"Waiting for input: {description} (unchanged {int(unchanged_seconds)}s)"
-                    if auto_responded:
-                        detail += " [auto-responded]"
+                    elif unchanged_seconds >= stall_threshold:
+                        event_to_emit = (
+                            AgentEventType.STALLED,
+                            f"Output unchanged for {int(unchanged_seconds)}s",
+                        )
+                        # Reset BEFORE emitting
+                        self._session_output_hashes[session.id] = (output_hash, now)
+
+                # Now perform side effects outside the lock (I/O should not
+                # hold the state lock to avoid blocking other coroutines).
+                if auto_respond_info:
+                    response_text, description = auto_respond_info
+                    try:
+                        await self._session.send_to_session(session.id, response_text)
+                        logger.info(
+                            "Watchdog auto-responded to %s in session %s (response=%r)",
+                            description, session.id[:8], response_text.strip(),
+                        )
+                        # Append "[auto-responded]" to event detail
+                        if event_to_emit:
+                            event_to_emit = (event_to_emit[0], event_to_emit[1] + " [auto-responded]")
+                    except Exception:
+                        logger.warning(
+                            "Failed to auto-respond to session %s",
+                            session.id, exc_info=True,
+                        )
+
+                if event_to_emit:
                     await self._emit_event(
                         session.id, session.task_id,
-                        AgentEventType.WAITING_INPUT,
-                        detail,
+                        event_to_emit[0],
+                        event_to_emit[1],
                     )
-                    # Reset hash so we don't re-fire every cycle
-                    self._session_output_hashes[session.id] = (output_hash, now)
-
-                elif unchanged_seconds >= stall_threshold:
-                    await self._emit_event(
-                        session.id, session.task_id,
-                        AgentEventType.STALLED,
-                        f"Output unchanged for {int(unchanged_seconds)}s",
-                    )
-                    # Reset to avoid spamming
-                    self._session_output_hashes[session.id] = (output_hash, now)
 
             except Exception:
                 logger.debug("Watchdog check failed for session %s", session.id, exc_info=True)
 
         # Clean up hashes for sessions that are no longer running
-        stale = set(self._session_output_hashes) - running_ids
-        for sid in stale:
-            del self._session_output_hashes[sid]
+        async with self._state_lock:
+            stale = set(self._session_output_hashes) - running_ids
+            for sid in stale:
+                del self._session_output_hashes[sid]
 
     async def _check_deadlines(self) -> None:
         """Stop sessions that have exceeded their deadline."""
         now = time.time()
-        expired = [
-            sid for sid, deadline in self._session_deadlines.items()
-            if now >= deadline
-        ]
-        for sid in expired:
-            self._session_deadlines.pop(sid, None)
+        async with self._state_lock:
+            expired = [
+                sid for sid, deadline in self._session_deadlines.items()
+                if now >= deadline
+            ]
+            for sid in expired:
+                self._session_deadlines.pop(sid, None)
             try:
                 session = await self._session.get_session(sid)
                 if session and session.lifecycle == SessionLifecycle.RUNNING:
@@ -1090,31 +1128,33 @@ class CoordinatorService:
         tool messages (which would break the next API call).
         """
         key = f"{channel}:{sender_id}"
-        if key not in self._conversations:
-            if self._history_repo:
-                try:
-                    messages = await self._history_repo.load_conversation(
-                        channel, sender_id
-                    )
-                    # Trim trailing messages that would leave the conversation
-                    # in a broken state. A valid conversation must end with
-                    # either a user message or an assistant message WITHOUT
-                    # tool_calls. Strip orphaned tool results and incomplete
-                    # tool-call sequences from the end.
-                    while messages:
-                        last = messages[-1]
-                        if last.role == "tool":
-                            messages.pop()
-                        elif last.role == "assistant" and last.tool_calls:
-                            messages.pop()
-                        else:
-                            break
-                    self._conversations[key] = messages
-                except Exception:
-                    logger.debug("Failed to load conversation history", exc_info=True)
+        async with self._state_lock:
+            if key not in self._conversations:
+                if self._history_repo:
+                    try:
+                        messages = await self._history_repo.load_conversation(
+                            channel, sender_id
+                        )
+                        # Trim trailing messages that would leave the conversation
+                        # in a broken state. A valid conversation must end with
+                        # either a user message or an assistant message WITHOUT
+                        # tool_calls. Strip orphaned tool results and incomplete
+                        # tool-call sequences from the end.
+                        while messages:
+                            last = messages[-1]
+                            if last.role == "tool":
+                                messages.pop()
+                            elif last.role == "assistant" and last.tool_calls:
+                                messages.pop()
+                            else:
+                                break
+                        self._conversations[key] = messages
+                    except Exception:
+                        logger.debug("Failed to load conversation history", exc_info=True)
+                        self._conversations[key] = []
+                else:
                     self._conversations[key] = []
-            else:
-                self._conversations[key] = []
+            self._conversation_last_used[key] = time.monotonic()
         return self._conversations[key]
 
     async def _save_conversation(self, channel: str, sender_id: str = "") -> None:
@@ -1122,13 +1162,14 @@ class CoordinatorService:
         if not self._history_repo:
             return
         key = f"{channel}:{sender_id}"
-        messages = self._conversations.get(key, [])
+        async with self._state_lock:
+            messages = list(self._conversations.get(key, []))
         try:
             await self._history_repo.save_conversation(channel, sender_id, messages)
         except Exception:
             logger.debug("Failed to save conversation history", exc_info=True)
 
-    def _truncate_conversation(self, messages: list[LLMMessage], max_exchanges: int = 20) -> list[LLMMessage]:
+    def _truncate_conversation(self, messages: list[LLMMessage], max_exchanges: int | None = None) -> list[LLMMessage]:
         """Truncate conversation to keep only the last N user/assistant exchanges.
 
         Preserves conversation context while preventing unbounded growth.
@@ -1136,6 +1177,8 @@ class CoordinatorService:
         call sequences are never split -- every assistant(tool_calls) message
         is always followed by its corresponding tool result messages.
         """
+        if max_exchanges is None:
+            max_exchanges = self._config.coordinator.max_conversation_exchanges
         if len(messages) <= max_exchanges * 3:
             return messages
 
@@ -1192,7 +1235,7 @@ class CoordinatorService:
         if not self._conversation_summary_repo:
             return
 
-        max_keep = 20 * 3  # max_exchanges * ~3 msgs per exchange
+        max_keep = self._config.coordinator.max_conversation_exchanges * 3
         if len(conversation) <= max_keep + 10:
             return
 
@@ -1202,7 +1245,8 @@ class CoordinatorService:
             return
 
         # Check if summarization has been failing repeatedly
-        failure_count = self._summary_failures.get(key, 0)
+        async with self._state_lock:
+            failure_count = self._summary_failures.get(key, 0)
         if failure_count >= _MAX_SUMMARY_FAILURES:
             logger.warning(
                 "Summarization for %s has failed %d times; skipping and truncating aggressively",
@@ -1215,7 +1259,8 @@ class CoordinatorService:
                 f"Conversation summarization failing for {key} ({failure_count} consecutive failures)",
             )
             # Reset counter to retry eventually
-            self._summary_failures[key] = 0
+            async with self._state_lock:
+                self._summary_failures[key] = 0
             return
 
         # Extract the messages that will be dropped for summarization
@@ -1263,11 +1308,13 @@ class CoordinatorService:
                 )
 
             # Reset failure counter on success
-            self._summary_failures.pop(key, None)
+            async with self._state_lock:
+                self._summary_failures.pop(key, None)
             logger.debug("Created conversation summary for %s (%d messages summarized)",
                          key, drop_count)
         except Exception:
-            self._summary_failures[key] = failure_count + 1
+            async with self._state_lock:
+                self._summary_failures[key] = failure_count + 1
             logger.debug(
                 "Failed to create conversation summary (failure %d/%d)",
                 failure_count + 1, _MAX_SUMMARY_FAILURES,
@@ -1308,17 +1355,17 @@ class CoordinatorService:
             try:
                 summary = await self._conversation_summary_repo.find_active(key)
             except Exception:
-                pass
+                logger.debug("Failed to load conversation summary", exc_info=True)
         if self._agent_event_repo:
             try:
                 unacked_events = await self._agent_event_repo.list_unacknowledged(limit=10)
             except Exception:
-                pass
+                logger.debug("Failed to load unacked events", exc_info=True)
         if self._session_report_repo:
             try:
                 recent_reports = await self._session_report_repo.list_recent(limit=5)
             except Exception:
-                pass
+                logger.debug("Failed to load recent reports", exc_info=True)
 
         # Build system prompt with live system state
         snapshot = await self._dashboard.load_snapshot()
@@ -1330,7 +1377,9 @@ class CoordinatorService:
         )
 
         # Add user message to history
-        conversation.append(LLMMessage(role="user", content=user_message))
+        async with self._state_lock:
+            conversation.append(LLMMessage(role="user", content=user_message))
+            self._conversation_last_used[key] = time.monotonic()
 
         # Truncate conversation to prevent unbounded growth
         truncated_conversation = self._truncate_conversation(conversation)
@@ -1346,7 +1395,7 @@ class CoordinatorService:
         total_tokens: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
 
         # LLM completion with tool use
-        max_tool_rounds = 10
+        max_tool_rounds = self._config.coordinator.max_tool_rounds
         response = None
         for _ in range(max_tool_rounds):
             response = await self._provider.complete(messages, self._llm_config)
@@ -1577,13 +1626,22 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         return {"error": f"Tool failed after {max_retries + 1} attempts: {last_error}"}
 
     async def _execute_tool(self, name: str, arguments: dict) -> Any:
-        """Execute a coordinator tool call via the handler registry."""
+        """Execute a coordinator tool call via the handler registry.
+
+        Tool execution is wrapped with a 120-second timeout to prevent
+        hung tools from blocking the coordinator indefinitely.
+        """
         try:
             handlers = get_tool_handlers()
             handler = handlers.get(name)
             if handler is None:
                 return {"error": f"Unknown tool: {name}"}
-            return await handler(self._tool_ctx, arguments)
+            return await asyncio.wait_for(
+                handler(self._tool_ctx, arguments), timeout=120
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Tool %s timed out after 120s", name)
+            return {"error": f"Tool {name} timed out after 120 seconds"}
         except KeyError as e:
             logger.warning("Tool %s missing required argument: %s", name, e)
             return {"error": f"Missing required argument: {e}"}
@@ -1626,7 +1684,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 )
             )
         except Exception:
-            logger.debug("Failed to log coordinator decision", exc_info=True)
+            logger.warning("Failed to log coordinator decision", exc_info=True)
 
     # --- Event Helpers ---
 
@@ -1637,9 +1695,33 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         event_type: AgentEventType,
         detail: str,
     ) -> None:
-        """Emit an agent event to MongoDB and send proactive Signal notifications."""
+        """Emit an agent event to MongoDB and send proactive Signal notifications.
+
+        For STALLED and WAITING_INPUT events, skips insertion if an
+        unacknowledged event of the same type already exists for this
+        session within the stall threshold window (deduplication).
+        """
         if not self._agent_event_repo:
             return
+
+        # Deduplicate repeating watchdog events
+        if session_id and event_type in (
+            AgentEventType.STALLED,
+            AgentEventType.WAITING_INPUT,
+        ):
+            try:
+                if await self._agent_event_repo.has_recent_unacked(
+                    session_id, event_type.value,
+                    within_seconds=self._config.coordinator.watchdog_stall_threshold,
+                ):
+                    logger.debug(
+                        "Skipping duplicate %s event for session %s",
+                        event_type.value, session_id[:8],
+                    )
+                    return
+            except Exception:
+                logger.debug("Dedup check failed, proceeding with insert", exc_info=True)
+
         try:
             await self._agent_event_repo.insert(
                 AgentEvent(
@@ -1650,7 +1732,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                 )
             )
         except Exception:
-            logger.debug("Failed to emit agent event", exc_info=True)
+            logger.warning("Failed to emit agent event", exc_info=True)
 
         # Proactive Signal notification for important events
         if event_type in (
@@ -1659,9 +1741,6 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
             AgentEventType.STALLED,
         ):
             await self._maybe_notify_phone(session_id, event_type, detail)
-
-    # Notification cooldown: max once per 5 minutes per (session, event_type)
-    _NOTIFICATION_COOLDOWN = 300
 
     async def _maybe_notify_phone(
         self,
@@ -1681,12 +1760,14 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         if not phone:
             return
 
-        # Rate-limit repeated notifications (once per 5 min per session+type)
+        # Rate-limit repeated notifications per session+type
         cooldown_key = f"{session_id}:{event_type.value}"
-        last_ts = self._notification_cooldowns.get(cooldown_key, 0.0)
-        if time.monotonic() - last_ts < self._NOTIFICATION_COOLDOWN:
-            return
-        self._notification_cooldowns[cooldown_key] = time.monotonic()
+        cooldown_secs = self._config.coordinator.notification_cooldown
+        async with self._state_lock:
+            last_ts = self._notification_cooldowns.get(cooldown_key, 0.0)
+            if time.monotonic() - last_ts < cooldown_secs:
+                return
+            self._notification_cooldowns[cooldown_key] = time.monotonic()
 
         # Build concise message
         label = event_type.value.upper()
@@ -1704,6 +1785,50 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         except Exception:
             logger.debug(
                 "Failed to send proactive notification", exc_info=True,
+            )
+
+    # --- Stale State Cleanup ---
+
+    async def _cleanup_stale_state(self) -> None:
+        """Remove stale entries from in-memory tracking dicts.
+
+        Called periodically from the watchdog loop to prevent unbounded
+        state accumulation in long-running server deployments.
+        """
+        now = time.monotonic()
+        async with self._state_lock:
+            # Remove notification cooldowns older than 1 hour
+            hour_ago = now - 3600
+            stale_cooldowns = [
+                k for k, ts in self._notification_cooldowns.items()
+                if ts < hour_ago
+            ]
+            for k in stale_cooldowns:
+                del self._notification_cooldowns[k]
+
+            # Remove summary failure entries for conversations no longer cached
+            stale_failures = [
+                k for k in self._summary_failures
+                if k not in self._conversations
+            ]
+            for k in stale_failures:
+                del self._summary_failures[k]
+
+            # Remove conversations idle for >24 hours
+            day_ago = now - 86400
+            stale_convos = [
+                k for k, last_used in self._conversation_last_used.items()
+                if last_used < day_ago
+            ]
+            for k in stale_convos:
+                self._conversations.pop(k, None)
+                self._conversation_last_used.pop(k, None)
+                self._summary_failures.pop(k, None)
+
+        if stale_cooldowns or stale_failures or stale_convos:
+            logger.info(
+                "Cleaned stale state: %d cooldowns, %d failure entries, %d conversations",
+                len(stale_cooldowns), len(stale_failures), len(stale_convos),
             )
 
     # --- Patrol Mode ---
@@ -1891,9 +2016,8 @@ Rules:
             LLMMessage(role="user", content=question),
         ]
 
-        max_tool_rounds = 10
         response = None
-        for _ in range(max_tool_rounds):
+        for _ in range(self._config.coordinator.max_tool_rounds):
             response = await self._provider.complete(messages, self._llm_config)
 
             if not response.has_tool_calls:
