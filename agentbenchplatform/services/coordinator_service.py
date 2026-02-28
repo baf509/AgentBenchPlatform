@@ -1884,7 +1884,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
         # Gather running session outputs (richer context)
         session_summaries: list[str] = []
         sessions = await self._session.list_sessions()
-        now = time.time()
+        now = time.monotonic()
         for s in sessions:
             if s.lifecycle == SessionLifecycle.RUNNING:
                 try:
@@ -1893,7 +1893,8 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     tail_text = "\n".join(f"    | {ln[:120]}" for ln in tail) if tail else "    (no output)"
 
                     # Determine output change status
-                    prev = self._session_output_hashes.get(s.id)
+                    async with self._state_lock:
+                        prev = self._session_output_hashes.get(s.id)
                     if prev:
                         unchanged_secs = int(now - prev[1])
                         if unchanged_secs > 60:
