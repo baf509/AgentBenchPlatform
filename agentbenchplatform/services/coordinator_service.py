@@ -1105,6 +1105,7 @@ class CoordinatorService:
             ]
             for sid in expired:
                 self._session_deadlines.pop(sid, None)
+        for sid in expired:
             try:
                 session = await self._session.get_session(sid)
                 if session and session.lifecycle == SessionLifecycle.RUNNING:
