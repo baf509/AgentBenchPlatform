@@ -121,6 +121,7 @@ class CoordinatorConfig:
     patrol_autonomy: str = "observe"  # observe, nudge, full
     patrol_notify_phone: str = ""
     auto_respond_prompts: bool = True
+    watchdog_prompt_interval: int = 5
     watchdog_check_interval: int = 30
     watchdog_stall_threshold: int = 600
     watchdog_idle_interval: int = 120
@@ -257,6 +258,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
             patrol_autonomy=coordinator_raw.get("patrol_autonomy", "observe"),
             patrol_notify_phone=coordinator_raw.get("patrol_notify_phone", ""),
             auto_respond_prompts=coordinator_raw.get("auto_respond_prompts", True),
+            watchdog_prompt_interval=coordinator_raw.get("watchdog_prompt_interval", 5),
             watchdog_check_interval=coordinator_raw.get("watchdog_check_interval", 30),
             watchdog_stall_threshold=coordinator_raw.get("watchdog_stall_threshold", 600),
             watchdog_idle_interval=coordinator_raw.get("watchdog_idle_interval", 120),

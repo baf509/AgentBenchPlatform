@@ -60,11 +60,25 @@ except ImportError:
 # Max consecutive summarization failures before aggressive truncation
 _MAX_SUMMARY_FAILURES = 3
 
-# Patterns that match common interactive prompts agents may encounter.
+# Prompt pattern tiers: "safe" patterns are read-only / low-risk operations
+# that can be auto-responded faster (3s). "normal" patterns keep the standard
+# 10s threshold.
 # Each tuple: (compiled regex, auto_response or None, human-readable description)
-INTERACTIVE_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
+
+SAFE_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
+    # File read prompts (cat, head, tail, less, read)
+    (re.compile(r"(?:cat|head|tail|less|read)\b.*\?", re.IGNORECASE), "y\n", "file read prompt"),
+    # Directory listing / folder access
+    (re.compile(r"(?:ls|dir|tree)\b.*\?", re.IGNORECASE), "y\n", "directory listing prompt"),
     # Claude Code permission prompts (safety net if bypassPermissions is off)
     (re.compile(r"Allow|Deny|allow this|deny this", re.IGNORECASE), "y\n", "permission prompt"),
+    # Press enter to continue
+    (re.compile(r"[Pp]ress [Ee]nter|press any key|hit enter"), "\n", "press enter prompt"),
+    # OpenCode permission patterns
+    (re.compile(r"approve|reject|Tool requires approval", re.IGNORECASE), "approve\n", "opencode tool approval"),
+]
+
+NORMAL_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
     # Generic yes/no confirmations
     (re.compile(r"\(y/n\)|\(Y/n\)|\[y/N\]|\[Y/n\]"), "y\n", "yes/no confirmation"),
     # "Do you want to proceed/continue?"
@@ -73,25 +87,31 @@ INTERACTIVE_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
     (re.compile(r"Do you want to install", re.IGNORECASE), "y\n", "install confirmation"),
     # Git prompts
     (re.compile(r"Are you sure you want to", re.IGNORECASE), "y\n", "git confirmation"),
-    # Press enter to continue
-    (re.compile(r"[Pp]ress [Ee]nter|press any key|hit enter"), "\n", "press enter prompt"),
-    # OpenCode permission patterns
-    (re.compile(r"approve|reject|Tool requires approval", re.IGNORECASE), "approve\n", "opencode tool approval"),
+]
+
+# Combined list for backward compatibility
+INTERACTIVE_PROMPT_PATTERNS: list[tuple[re.Pattern, str | None, str]] = [
+    *SAFE_PROMPT_PATTERNS,
+    *NORMAL_PROMPT_PATTERNS,
 ]
 
 
-def _detect_interactive_prompt(output: str) -> tuple[str | None, str] | None:
+def _detect_interactive_prompt(output: str) -> tuple[str | None, str, str] | None:
     """Check if output ends with a known interactive prompt.
 
     Examines the last 5 non-empty lines for matches.
-    Returns (auto_response, description) if matched, None otherwise.
+    Returns (auto_response, description, tier) if matched, None otherwise.
+    Tier is ``"safe"`` for read-only/low-risk patterns, ``"normal"`` otherwise.
     """
     lines = [ln for ln in output.strip().splitlines() if ln.strip()]
     tail = lines[-5:] if len(lines) >= 5 else lines
     for line in reversed(tail):
-        for pattern, auto_response, description in INTERACTIVE_PROMPT_PATTERNS:
+        for pattern, auto_response, description in SAFE_PROMPT_PATTERNS:
             if pattern.search(line):
-                return (auto_response, description)
+                return (auto_response, description, "safe")
+        for pattern, auto_response, description in NORMAL_PROMPT_PATTERNS:
+            if pattern.search(line):
+                return (auto_response, description, "normal")
     return None
 
 
@@ -896,8 +916,9 @@ class CoordinatorService:
         self._watchdog_task = asyncio.ensure_future(
             self._watchdog_loop(ci, st, ii)
         )
-        logger.info("Coordinator watchdog started (active=%ds, idle=%ds, stall=%ds)",
-                     ci, ii, st)
+        pi = self._config.coordinator.watchdog_prompt_interval
+        logger.info("Coordinator watchdog started (prompt=%ds, active=%ds, idle=%ds, stall=%ds)",
+                     pi, ci, ii, st)
         # Start patrol if configured
         if self._config.coordinator.patrol_enabled and self._patrol_task is None:
             self._patrol_task = asyncio.ensure_future(self._patrol_loop())
@@ -923,13 +944,15 @@ class CoordinatorService:
     ) -> None:
         """Periodically check session health and deadlines.
 
-        Uses *check_interval* (fast) when sessions are running,
-        *idle_interval* (slow) when none are active.
+        Uses *prompt_interval* (fastest, default 5s) when sessions are
+        running — lightweight check of tmux output + hash comparison.
+        Falls back to *idle_interval* when no sessions are active.
         """
+        prompt_interval = self._config.coordinator.watchdog_prompt_interval
         try:
             while True:
                 has_running = await self._has_running_sessions()
-                interval = check_interval if has_running else idle_interval
+                interval = prompt_interval if has_running else idle_interval
                 await asyncio.sleep(interval)
                 try:
                     await self._check_sessions(stall_threshold)
@@ -1039,12 +1062,14 @@ class CoordinatorService:
 
                     # Check for interactive prompt patterns
                     prompt_match = _detect_interactive_prompt(output)
-                    if prompt_match and unchanged_seconds >= 10:
-                        auto_response, description = prompt_match
+                    if prompt_match:
+                        auto_response, description, tier = prompt_match
+                        threshold = 3 if tier == "safe" else 10
+                        if unchanged_seconds < threshold:
+                            continue
                         if (
                             auto_response
                             and self._config.coordinator.auto_respond_prompts
-                            and self._config.coordinator.patrol_autonomy in ("nudge", "full")
                         ):
                             auto_respond_info = (auto_response, description)
                         detail = f"Waiting for input: {description} (unchanged {int(unchanged_seconds)}s)"
