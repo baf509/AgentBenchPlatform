@@ -15,6 +15,7 @@ import random
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -59,6 +60,15 @@ except ImportError:
 
 # Max consecutive summarization failures before aggressive truncation
 _MAX_SUMMARY_FAILURES = 3
+
+
+@dataclass
+class _SessionOutputState:
+    """Tracks the current output and whether it already triggered an alert."""
+
+    output_hash: str
+    last_change_at: float
+    alerted_event: AgentEventType | None = None
 
 # Prompt pattern tiers: "safe" patterns are read-only / low-risk operations
 # that can be auto-responded faster (3s). "normal" patterns keep the standard
@@ -844,8 +854,8 @@ class CoordinatorService:
         self._watchdog_task: asyncio.Task | None = None
         self._patrol_task: asyncio.Task | None = None
         self._session_deadlines: dict[str, float] = {}  # session_id -> deadline timestamp
-        # Output change tracking: session_id -> (output_hash, timestamp_of_last_change)
-        self._session_output_hashes: dict[str, tuple[str, float]] = {}
+        # Output change tracking: session_id -> current output state
+        self._session_output_hashes: dict[str, _SessionOutputState] = {}
         # Track consecutive summarization failures per conversation key
         self._summary_failures: dict[str, int] = {}
         # Proactive Signal notification tracking
@@ -1030,11 +1040,21 @@ class CoordinatorService:
                     async with self._state_lock:
                         prev = self._session_output_hashes.get(session.id)
                         if prev is None:
-                            self._session_output_hashes[session.id] = ("", now)
-                        elif now - prev[1] >= stall_threshold:
-                            event_detail = f"No output detected (unchanged for {int(now - prev[1])}s)"
-                            # Reset timestamp BEFORE emitting to prevent re-fire
-                            self._session_output_hashes[session.id] = ("", now)
+                            self._session_output_hashes[session.id] = _SessionOutputState("", now)
+                        elif prev.output_hash != "":
+                            self._session_output_hashes[session.id] = _SessionOutputState("", now)
+                        elif (
+                            prev.alerted_event != AgentEventType.STALLED
+                            and now - prev.last_change_at >= stall_threshold
+                        ):
+                            event_detail = (
+                                f"No output detected (unchanged for {int(now - prev.last_change_at)}s)"
+                            )
+                            self._session_output_hashes[session.id] = _SessionOutputState(
+                                "",
+                                prev.last_change_at,
+                                AgentEventType.STALLED,
+                            )
                     if event_detail:
                         await self._emit_event(
                             session.id, session.task_id,
@@ -1052,20 +1072,23 @@ class CoordinatorService:
                 async with self._state_lock:
                     prev = self._session_output_hashes.get(session.id)
 
-                    if prev is None or prev[0] != output_hash:
+                    if prev is None or prev.output_hash != output_hash:
                         # Output changed — update tracking, nothing to emit
-                        self._session_output_hashes[session.id] = (output_hash, now)
+                        self._session_output_hashes[session.id] = _SessionOutputState(output_hash, now)
                         continue
 
                     # Output unchanged — check how long
-                    unchanged_seconds = now - prev[1]
+                    unchanged_seconds = now - prev.last_change_at
 
                     # Check for interactive prompt patterns
                     prompt_match = _detect_interactive_prompt(output)
                     if prompt_match:
                         auto_response, description, tier = prompt_match
                         threshold = 3 if tier == "safe" else 10
-                        if unchanged_seconds < threshold:
+                        if (
+                            unchanged_seconds < threshold
+                            or prev.alerted_event == AgentEventType.WAITING_INPUT
+                        ):
                             continue
                         if (
                             auto_response
@@ -1074,16 +1097,25 @@ class CoordinatorService:
                             auto_respond_info = (auto_response, description)
                         detail = f"Waiting for input: {description} (unchanged {int(unchanged_seconds)}s)"
                         event_to_emit = (AgentEventType.WAITING_INPUT, detail)
-                        # Reset BEFORE emitting
-                        self._session_output_hashes[session.id] = (output_hash, now)
+                        self._session_output_hashes[session.id] = _SessionOutputState(
+                            output_hash,
+                            prev.last_change_at,
+                            AgentEventType.WAITING_INPUT,
+                        )
 
-                    elif unchanged_seconds >= stall_threshold:
+                    elif (
+                        unchanged_seconds >= stall_threshold
+                        and prev.alerted_event != AgentEventType.STALLED
+                    ):
                         event_to_emit = (
                             AgentEventType.STALLED,
                             f"Output unchanged for {int(unchanged_seconds)}s",
                         )
-                        # Reset BEFORE emitting
-                        self._session_output_hashes[session.id] = (output_hash, now)
+                        self._session_output_hashes[session.id] = _SessionOutputState(
+                            output_hash,
+                            prev.last_change_at,
+                            AgentEventType.STALLED,
+                        )
 
                 # Now perform side effects outside the lock (I/O should not
                 # hold the state lock to avoid blocking other coroutines).
@@ -1940,7 +1972,7 @@ Use the available tools to inspect and manage the system. Be helpful, concise, a
                     async with self._state_lock:
                         prev = self._session_output_hashes.get(s.id)
                     if prev:
-                        unchanged_secs = int(now - prev[1])
+                        unchanged_secs = int(now - prev.last_change_at)
                         if unchanged_secs > 60:
                             status = f"unchanged for {unchanged_secs // 60}m{unchanged_secs % 60}s"
                         else:
